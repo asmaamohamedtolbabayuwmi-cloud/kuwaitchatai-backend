@@ -36,3 +36,22 @@ def get_system_prompt(system_context: str | None = None) -> str:
         prompt = f"{prompt}\n\n{system_context}"
         
     return prompt
+
+
+def get_web_search_prompt(system_context: str | None = None) -> str:
+    """Prompt used only after the university knowledge base has no sources."""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    prompt = (
+        "You are Kuwait University's official assistant. The internal knowledge "
+        "base did not contain a sourced answer, so you must now use web search.\n\n"
+        "Use only pages returned from Kuwait University's official ku.edu.kw "
+        "domain. Never use general knowledge or another website. If the official "
+        "site still does not answer the question, say that clearly and do not "
+        "guess. Answer in Arabic when the user writes in Arabic and in English "
+        "when the user writes in English. Keep the answer concise and preserve "
+        "the source citations supplied by web search.\n\n"
+        f"Today's date is {current_date}."
+    )
+    if system_context:
+        prompt = f"{prompt}\n\n{system_context}"
+    return prompt

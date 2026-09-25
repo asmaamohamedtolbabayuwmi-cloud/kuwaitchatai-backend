@@ -11,8 +11,13 @@ import time
 from datetime import datetime
 from typing import AsyncIterator
 
-from ..prompts import get_system_prompt
-from .query_router import should_use_file_search
+from ..prompts import get_system_prompt, get_web_search_prompt
+from .query_router import (
+    ku_web_search_tool,
+    should_fallback_to_web,
+    should_use_file_search,
+    web_search_status,
+)
 from .missed_query_service import analyze_and_log_missed_query
 
 from ..chat_repository import (
@@ -88,8 +93,9 @@ async def process_chat(
     system_prompt = get_system_prompt(system_context)
 
     # 5. Route: Decide if we need File Search
+    use_file_search = should_use_file_search(message)
     tools = []
-    if should_use_file_search(message):
+    if use_file_search:
         tools.append({
             "type": "file_search",
             "vector_store_ids": [config.OPENAI_VECTOR_STORE_ID],
@@ -103,29 +109,84 @@ async def process_chat(
 
     openai_start = time.perf_counter()
 
+    def parse_sse(sse_line: str) -> dict | None:
+        if not sse_line.startswith("data: "):
+            return None
+        try:
+            return json.loads(sse_line[6:].strip())
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to decode SSE line: %s", exc)
+            return None
+
     try:
-        async for sse_line in stream_response(history_dicts, system_prompt, tools=tools):
-            # Capture TTFT on first chunk
-            if ttft is None and '"type": "chunk"' in sse_line:
-                ttft = time.perf_counter() - openai_start
-                
-            # Intercept "done" event to extract citations and usage before forwarding
-            if sse_line.startswith("data: "):
-                raw_json = sse_line[6:].strip()
-                try:
-                    payload = json.loads(raw_json)
+        if use_file_search:
+            buffered_lines: list[str] = []
+            retrieved_text: list[str] = []
+            retrieved_citations: list[dict] = []
+            retrieved_usage = None
+
+            async for sse_line in stream_response(
+                history_dicts, system_prompt, tools=tools
+            ):
+                buffered_lines.append(sse_line)
+                payload = parse_sse(sse_line)
+                if payload is None:
+                    continue
+                if payload.get("type") == "chunk":
+                    retrieved_text.append(payload.get("content", ""))
+                elif payload.get("type") == "done":
+                    retrieved_citations.extend(payload.get("citations", []))
+                    retrieved_usage = payload.get("usage")
+
+            retrieved_answer = "".join(retrieved_text).strip()
+            if not should_fallback_to_web(
+                retrieved_answer,
+                retrieved_citations,
+            ):
+                accumulated_text.extend(retrieved_text)
+                accumulated_citations.extend(retrieved_citations)
+                token_usage = retrieved_usage
+                for sse_line in buffered_lines:
+                    if ttft is None and '"type": "chunk"' in sse_line:
+                        ttft = time.perf_counter() - openai_start
+                    yield sse_line
+            else:
+                status = web_search_status(message)
+                yield "data: " + json.dumps(
+                    {"type": "chunk", "content": status}
+                ) + "\n\n"
+
+                async for sse_line in stream_response(
+                    history_dicts,
+                    get_web_search_prompt(system_context),
+                    tools=[ku_web_search_tool()],
+                ):
+                    if ttft is None and '"type": "chunk"' in sse_line:
+                        ttft = time.perf_counter() - openai_start
+                    payload = parse_sse(sse_line)
+                    if payload is not None:
+                        if payload.get("type") == "chunk":
+                            accumulated_text.append(payload.get("content", ""))
+                        elif payload.get("type") == "done":
+                            accumulated_citations.extend(
+                                payload.get("citations", [])
+                            )
+                            token_usage = payload.get("usage")
+                    yield sse_line
+        else:
+            async for sse_line in stream_response(
+                history_dicts, system_prompt, tools=[]
+            ):
+                if ttft is None and '"type": "chunk"' in sse_line:
+                    ttft = time.perf_counter() - openai_start
+                payload = parse_sse(sse_line)
+                if payload is not None:
                     if payload.get("type") == "chunk":
                         accumulated_text.append(payload.get("content", ""))
                     elif payload.get("type") == "done":
-                        accumulated_citations.extend(
-                            payload.get("citations", [])
-                        )
+                        accumulated_citations.extend(payload.get("citations", []))
                         token_usage = payload.get("usage")
-                except json.JSONDecodeError as jde:
-                    logger.warning("Failed to decode SSE line: %s", jde)
-                except Exception as e:
-                    logger.error("Unexpected error parsing SSE line: %s", e)
-            yield sse_line
+                yield sse_line
             
     except asyncio.CancelledError:
         logger.warning("Client disconnected during stream for session %s", session_id)
@@ -170,7 +231,7 @@ async def process_chat(
             )
         
         # 8. Background Task: Missed Query Analytics
-        was_file_search_attempted = len(tools) > 0
+        was_file_search_attempted = use_file_search
         if (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text:
             background_tasks.create_task(
                 analyze_and_log_missed_query(

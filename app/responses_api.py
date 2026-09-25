@@ -66,7 +66,8 @@ async def stream_response(
     ]
 
     full_text_parts: list[str] = []
-    raw_citations: list[dict] = []   # {file_id, index}
+    raw_citations: list[dict] = []   # file and URL citations
+    usage: dict | None = None
 
     try:
         import traceback
@@ -104,6 +105,13 @@ async def stream_response(
                 # ── Completed: collect file_search annotations ──────────
                 elif event_type == "response.completed":
                     response = event.response
+                    response_usage = getattr(response, "usage", None)
+                    if response_usage is not None:
+                        usage = {
+                            "prompt_tokens": getattr(response_usage, "input_tokens", 0),
+                            "completion_tokens": getattr(response_usage, "output_tokens", 0),
+                            "total_tokens": getattr(response_usage, "total_tokens", 0),
+                        }
                     for output in getattr(response, "output", None) or []:
                         if getattr(output, "type", None) == "message":
                             for part in getattr(output, "content", None) or []:
@@ -121,6 +129,19 @@ async def stream_response(
                                                     "index": ann.index,
                                                 }
                                             )
+                                        elif (
+                                            getattr(ann, "type", None)
+                                            == "url_citation"
+                                        ):
+                                            raw_citations.append(
+                                                {
+                                                    "type": "url_citation",
+                                                    "url": ann.url,
+                                                    "title": getattr(ann, "title", ann.url),
+                                                    "start_index": getattr(ann, "start_index", 0),
+                                                    "end_index": getattr(ann, "end_index", 0),
+                                                }
+                                            )
 
     except Exception as exc:
         import traceback
@@ -135,13 +156,46 @@ async def stream_response(
         return
 
     # ── Resolve filenames (post-stream, non-blocking) ───────────────────
-    citations = await _resolve_citations(raw_citations)
+    file_citations = [
+        item for item in raw_citations if item.get("type") != "url_citation"
+    ]
+    url_citations = [
+        item for item in raw_citations if item.get("type") == "url_citation"
+    ]
+    citations = await _resolve_citations(file_citations)
 
-    citation_list = [
-        {"file_id": c.file_id, "filename": c.filename, "index": c.index}
+    citation_list: list[dict] = [
+        {
+            "type": "file_citation",
+            "file_id": c.file_id,
+            "filename": c.filename,
+            "index": c.index,
+        }
         for c in citations
     ]
-    yield "data: " + json.dumps({"type": "done", "citations": citation_list}) + "\n\n"
+    seen_urls: set[str] = set()
+    for citation in url_citations:
+        if citation["url"] in seen_urls:
+            continue
+        seen_urls.add(citation["url"])
+        citation_list.append(citation)
+
+    if url_citations:
+        links = []
+        for citation in citation_list:
+            if citation.get("type") == "url_citation":
+                title = citation.get("title") or citation["url"]
+                links.append(f"- [{title}]({citation['url']})")
+        if links:
+            sources = "\n\n**المصادر / Sources:**\n" + "\n".join(links)
+            yield "data: " + json.dumps(
+                {"type": "chunk", "content": sources}
+            ) + "\n\n"
+
+    done = {"type": "done", "citations": citation_list}
+    if usage is not None:
+        done["usage"] = usage
+    yield "data: " + json.dumps(done) + "\n\n"
 
 
 async def _resolve_citations(
