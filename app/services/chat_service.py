@@ -16,7 +16,6 @@ from .query_router import (
     ku_web_search_tool,
     should_fallback_to_web,
     should_use_file_search,
-    web_search_status,
 )
 from .missed_query_service import analyze_and_log_missed_query
 
@@ -120,6 +119,9 @@ async def process_chat(
 
     try:
         if use_file_search:
+            yield "data: " + json.dumps(
+                {"type": "status", "status": "searching_knowledge"}
+            ) + "\n\n"
             buffered_lines: list[str] = []
             retrieved_text: list[str] = []
             retrieved_citations: list[dict] = []
@@ -143,6 +145,9 @@ async def process_chat(
                 retrieved_answer,
                 retrieved_citations,
             ):
+                yield "data: " + json.dumps(
+                    {"type": "status", "status": "generating_answer"}
+                ) + "\n\n"
                 accumulated_text.extend(retrieved_text)
                 accumulated_citations.extend(retrieved_citations)
                 token_usage = retrieved_usage
@@ -151,9 +156,8 @@ async def process_chat(
                         ttft = time.perf_counter() - openai_start
                     yield sse_line
             else:
-                status = web_search_status(message)
                 yield "data: " + json.dumps(
-                    {"type": "chunk", "content": status}
+                    {"type": "status", "status": "searching_ku_web"}
                 ) + "\n\n"
 
                 async for sse_line in stream_response(
@@ -174,6 +178,9 @@ async def process_chat(
                             token_usage = payload.get("usage")
                     yield sse_line
         else:
+            yield "data: " + json.dumps(
+                {"type": "status", "status": "generating_answer"}
+            ) + "\n\n"
             async for sse_line in stream_response(
                 history_dicts, system_prompt, tools=[]
             ):
