@@ -1,6 +1,6 @@
 """Authenticated endpoint for importing Kuwait University schedule PDFs."""
 
-from __future__ import annotations
+
 
 import logging
 from pathlib import Path
