@@ -6,6 +6,7 @@ Endpoints:
   GET    /assets              List files in Vector Store
   DELETE /assets/{file_id}   Delete file from Vector Store
   POST   /chat                SSE streaming chat (Responses API + file_search)
+  POST   /schedules/import    Extract and store a student schedule PDF
   GET    /health              Health check
 
 All endpoints (except /health) require:
@@ -16,6 +17,7 @@ Environment variables (set on Railway → Variables):
   OPENAI_VECTOR_STORE_ID
   FIREBASE_SERVICE_ACCOUNT_JSON
   OPENAI_MODEL               (optional, default: gpt-4o)
+  OPENAI_SCHEDULE_MODEL      (optional, defaults to OPENAI_MODEL)
   HISTORY_TOKEN_BUDGET       (optional, default: 3000)
   PORT                       (set automatically by Railway)
 """
@@ -37,7 +39,7 @@ import uuid
 
 from app.firebase import init_firebase
 from app.limiter import limiter
-from app.routers import assets_router, chat_router, upload_router
+from app.routers import assets_router, chat_router, schedules_router, upload_router
 from app.logger import setup_logging, request_id_var
 from app.task_tracker import background_tasks
 
@@ -58,8 +60,9 @@ async def lifespan(app: FastAPI):
     try:
         cfg = get_config()
         logger.info(
-            "Config OK — model=%s  vector_store=%s  history_budget=%d",
+            "Config OK — model=%s  schedule_model=%s  vector_store=%s  history_budget=%d",
             cfg.OPENAI_MODEL,
+            cfg.OPENAI_SCHEDULE_MODEL,
             cfg.OPENAI_VECTOR_STORE_ID,
             cfg.HISTORY_TOKEN_BUDGET,
         )
@@ -133,6 +136,7 @@ app.add_middleware(CorrelationIdMiddleware)
 app.include_router(upload_router)
 app.include_router(assets_router)
 app.include_router(chat_router)
+app.include_router(schedules_router)
 
 @app.get("/health", tags=["health"])
 async def health():
