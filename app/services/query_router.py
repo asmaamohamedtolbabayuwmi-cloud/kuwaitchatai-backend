@@ -85,3 +85,43 @@ def should_use_file_search(user_message: str) -> bool:
         
     # If in doubt, ALWAYS retrieve.
     return True
+
+
+_PERSONAL_SCHEDULE_PATTERNS = (
+    r"\bجدولي\b",
+    r"\bجداولي\b",
+    r"\bموادي\b",
+    r"\bمقرراتي\b",
+    r"\bمحاضراتي\b",
+    r"\bشعبي\b",
+    r"\bسكاشني\b",
+    r"\bدكاترتي\b",
+    r"\bاختباراتي\b",
+    r"\bفاينلاتي\b",
+    r"\bمحاضرتي\b",
+    r"\bاختباري\b",
+    r"\bفاينلي\b",
+    r"\bمادتي\b",
+    r"\bشعبتي\b",
+    r"\bدكتوري\b",
+    r"الجدول (?:اللي|الذي) رفعت",
+    r"الجداول (?:اللي|التي) رفعت",
+    r"الفصول (?:اللي|التي) رفعت",
+    r"قارن .*?(?:جداول|فصول)",
+    r"كنت (?:مسجل|ماخذ|آخذ)",
+    r"المواد (?:المسجلة|المنسحبة) (?:عندي|لي)",
+    r"(?:إيه|ايه|شنو|وش) عندي (?:اليوم|بكرة|غد|يوم)",
+    r"عندي (?:إيه|ايه|شنو|وش) (?:اليوم|بكرة|غد|يوم)",
+    r"ارفع (?:جدول|الجدول)",
+    r"رفع (?:جدول|الجدول)",
+    r"\bmy schedule\b",
+    r"\bmy (?:courses|classes|sections|instructors|exams)\b",
+    r"\bschedules? i (?:uploaded|added)\b",
+    r"\bcourses? i (?:am|was) (?:taking|registered in)\b",
+)
+
+
+def is_user_schedule_query(user_message: str) -> bool:
+    """Return True for questions about the authenticated user's own schedules."""
+    text = " ".join(user_message.strip().lower().split())
+    return any(re.search(pattern, text) for pattern in _PERSONAL_SCHEDULE_PATTERNS)

@@ -13,6 +13,7 @@ from typing import AsyncIterator
 
 from ..prompts import get_system_prompt, get_web_search_prompt
 from .query_router import (
+    is_user_schedule_query,
     ku_web_search_tool,
     should_fallback_to_web,
     should_use_file_search,
@@ -27,6 +28,8 @@ from ..chat_repository import (
 from ..config import get_config
 from ..history_builder import build_history
 from ..responses_api import stream_response
+from ..schedule_repository import load_user_schedules
+from .schedule_context import build_schedule_context
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, uid_var
 
@@ -74,11 +77,26 @@ async def process_chat(
 
     background_tasks.create_task(safe_save_user_message())
 
-    # 2. Load history
+    # 2. Load history and every stored schedule version concurrently.
     db_load_start = time.perf_counter()
-    raw_messages = await load_recent_messages(uid, session_id, max_docs)
+    async def safe_load_schedules() -> list[dict] | None:
+        try:
+            return await load_user_schedules(uid)
+        except Exception as exc:
+            logger.exception("Failed to load schedules for user %s: %s", uid, exc)
+            return None
+
+    raw_messages, schedules = await asyncio.gather(
+        load_recent_messages(uid, session_id, max_docs),
+        safe_load_schedules(),
+    )
     db_latency = time.perf_counter() - db_load_start
-    logger.info("Firestore load latency for session %s: %.3fs", session_id, db_latency)
+    logger.info(
+        "Firestore context load latency for session %s: %.3fs (schedules=%s)",
+        session_id,
+        db_latency,
+        "unavailable" if schedules is None else len(schedules),
+    )
 
     # 3. Build token-limited context (returns chronological list)
     history = build_history(raw_messages, config.HISTORY_TOKEN_BUDGET)
@@ -88,11 +106,13 @@ async def process_chat(
     # Append the current user message at the end
     history_dicts.append({"role": "user", "content": message})
 
-    # 4. Build system prompt
-    system_prompt = get_system_prompt(system_context)
+    # 4. Build system prompt with a compact structured view of all schedules.
+    schedule_context = build_schedule_context(schedules)
+    system_prompt = get_system_prompt(system_context, schedule_context)
 
     # 5. Route: Decide if we need File Search
-    use_file_search = should_use_file_search(message)
+    schedule_query = is_user_schedule_query(message)
+    use_file_search = should_use_file_search(message) and not schedule_query
     tools = []
     if use_file_search:
         tools.append({
@@ -162,7 +182,7 @@ async def process_chat(
 
                 async for sse_line in stream_response(
                     history_dicts,
-                    get_web_search_prompt(system_context),
+                    get_web_search_prompt(system_context, schedule_context),
                     tools=[ku_web_search_tool()],
                 ):
                     if ttft is None and '"type": "chunk"' in sse_line:
