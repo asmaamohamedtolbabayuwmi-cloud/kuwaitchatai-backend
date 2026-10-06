@@ -1,4 +1,5 @@
 from app.services.query_router import (
+    is_user_schedule_query,
     ku_web_search_tool,
     should_fallback_to_web,
     web_search_status,
@@ -36,3 +37,10 @@ def test_no_fallback_for_a_source_backed_answer():
 
 def test_fallback_when_file_search_returns_no_citations():
     assert should_fallback_to_web("No sourced answer", []) is True
+
+
+def test_personal_schedule_queries_bypass_university_document_search():
+    assert is_user_schedule_query("قارن بين جداولي في آخر أربع فصول") is True
+    assert is_user_schedule_query("إيه المواد اللي كنت مسجلها السنة اللي فاتت؟") is True
+    assert is_user_schedule_query("What courses were in my schedule?") is True
+    assert is_user_schedule_query("ما شروط التسجيل في جامعة الكويت؟") is False
