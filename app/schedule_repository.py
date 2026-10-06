@@ -9,6 +9,33 @@ from google.cloud import firestore
 from .services.schedule_fingerprint import ScheduleIdentity
 from .services.schedule_models import ScheduleExtraction
 
+SCHEDULE_CONTEXT_FIELDS = (
+    "termKey",
+    "createdAt",
+    "student",
+    "term",
+    "credits",
+    "courses",
+)
+
+
+async def load_user_schedules(uid: str) -> list[dict]:
+    """Load every structured schedule version owned by the authenticated user."""
+    db = firestore_async.client()
+    schedules_ref = (
+        db.collection("users")
+        .document(uid)
+        .collection("schedules")
+    )
+    query = schedules_ref.select(SCHEDULE_CONTEXT_FIELDS)
+
+    schedules: list[dict] = []
+    async for snapshot in query.stream():
+        data = snapshot.to_dict()
+        if data:
+            schedules.append(data)
+    return schedules
+
 
 async def create_schedule_version(
     uid: str,
