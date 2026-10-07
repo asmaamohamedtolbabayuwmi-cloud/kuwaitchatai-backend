@@ -42,5 +42,8 @@ def test_fallback_when_file_search_returns_no_citations():
 def test_personal_schedule_queries_bypass_university_document_search():
     assert is_user_schedule_query("قارن بين جداولي في آخر أربع فصول") is True
     assert is_user_schedule_query("إيه المواد اللي كنت مسجلها السنة اللي فاتت؟") is True
+    assert is_user_schedule_query("انا ال grade بتاعي اي") is True
+    assert is_user_schedule_query("كم معدلي العام؟") is True
+    assert is_user_schedule_query("What is my academic level?") is True
     assert is_user_schedule_query("What courses were in my schedule?") is True
     assert is_user_schedule_query("ما شروط التسجيل في جامعة الكويت؟") is False

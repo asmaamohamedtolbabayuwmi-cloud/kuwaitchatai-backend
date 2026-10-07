@@ -78,3 +78,22 @@ def test_unavailable_context_does_not_claim_that_no_schedule_was_uploaded():
 
     assert '"availability":"unavailable"' in prompt
     assert "لا تدّعِ أن المستخدم لم يرفع جدولًا" in prompt
+
+
+def test_available_schedule_prompt_never_claims_schedule_is_missing():
+    context = build_schedule_context(
+        [
+            {
+                "termKey": "term-1",
+                "student": {"academicLevel": "السنة الثالثة"},
+                "term": {"academicYear": "2025/2026", "semester": "الأول"},
+                "courses": [],
+            }
+        ]
+    )
+
+    prompt = get_system_prompt(schedule_context=context)
+
+    assert '"availability":"available"' in prompt
+    assert "لا تقل أبداً إنه لم يرفع جدولاً" in prompt
+    assert "student.academicLevel" in prompt

@@ -12,6 +12,7 @@ def test_chat_injects_every_schedule_and_skips_public_rag_for_personal_query():
         {
             "termKey": "term-1",
             "createdAt": datetime(2025, 9, 1, tzinfo=timezone.utc),
+            "student": {"academicLevel": "السنة الثالثة"},
             "term": {"academicYear": "2025/2026", "semester": "الأول"},
             "courses": [{"courseCode": "101", "courseName": "Course One"}],
         },
@@ -50,7 +51,7 @@ def test_chat_injects_every_schedule_and_skips_public_rag_for_personal_query():
             async for event in process_chat(
                 uid="user-123",
                 session_id="session-123",
-                message="قارن بين جداولي",
+                message="انا ال grade بتاعي اي",
             )
         ]
 
@@ -71,3 +72,4 @@ def test_chat_injects_every_schedule_and_skips_public_rag_for_personal_query():
     assert '"scheduleCount":2' in captured["system_prompt"]
     assert '"courseCode":"101"' in captured["system_prompt"]
     assert '"courseCode":"201"' in captured["system_prompt"]
+    assert '"academicLevel":"السنة الثالثة"' in captured["system_prompt"]
