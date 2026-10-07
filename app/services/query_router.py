@@ -116,8 +116,14 @@ _PERSONAL_SCHEDULE_PATTERNS = (
     r"رفع (?:جدول|الجدول)",
     r"\bmy schedule\b",
     r"\bmy (?:courses|classes|sections|instructors|exams)\b",
+    r"\bmy (?:grade|level|academic level|gpa|major|minor|college|credits|academic status)\b",
+    r"\bwhat(?: is|'s) my (?:grade|level|academic level|gpa|major|minor|college|credits|academic status)\b",
     r"\bschedules? i (?:uploaded|added)\b",
     r"\bcourses? i (?:am|was) (?:taking|registered in)\b",
+    r"(?:انا|أنا|اني|إني).{0,30}\b(?:grade|level|gpa)\b",
+    r"\b(?:grade|level|gpa)\s+(?:بتاعي|بتاعتي|حقي|مالي)\b",
+    r"\b(?:معدلي|مستواي|مرحلتي|تخصصي|كليتي|ساعاتي|إنذاراتي|انذاراتي)\b",
+    r"\b(?:حالتي|وضعي) (?:الدراسية|الأكاديمية|الاكاديمية)\b",
 )
 
 
