@@ -13,10 +13,10 @@ from typing import AsyncIterator
 
 from ..prompts import get_system_prompt, get_web_search_prompt
 from .query_router import (
-    is_user_schedule_query,
+    QueryIntent,
+    classify_query,
     ku_web_search_tool,
     should_fallback_to_web,
-    should_use_file_search,
 )
 from .missed_query_service import analyze_and_log_missed_query
 
@@ -49,7 +49,7 @@ async def process_chat(
     and saves the final response.
     """
     config = get_config()
-    
+
     # Set context variables for structured logging
     chat_id_var.set(session_id)
     uid_var.set(uid)
@@ -61,7 +61,9 @@ async def process_chat(
     # ~50 tokens per message on average → budget / 50 + small headroom
     max_docs = max(10, config.HISTORY_TOKEN_BUDGET // 50 + 5)
 
-    # 1. Save user message concurrently
+    # Define the resilient write now, but start it only after history is read.
+    # Otherwise the write can win the race and the current turn is both loaded
+    # from Firestore and manually appended below.
     async def safe_save_user_message():
         db_start = time.perf_counter()
         for attempt in range(3):
@@ -75,9 +77,7 @@ async def process_chat(
                 else:
                     await asyncio.sleep(1)
 
-    background_tasks.create_task(safe_save_user_message())
-
-    # 2. Load history and every stored schedule version concurrently.
+    # 1. Load history and every stored schedule version concurrently.
     db_load_start = time.perf_counter()
     async def safe_load_schedules() -> list[dict] | None:
         try:
@@ -86,10 +86,15 @@ async def process_chat(
             logger.exception("Failed to load schedules for user %s: %s", uid, exc)
             return None
 
-    raw_messages, schedules = await asyncio.gather(
-        load_recent_messages(uid, session_id, max_docs),
-        safe_load_schedules(),
-    )
+    try:
+        raw_messages, schedules = await asyncio.gather(
+            load_recent_messages(uid, session_id, max_docs),
+            safe_load_schedules(),
+        )
+    finally:
+        # Preserve the previous best-effort persistence behavior even if a
+        # context read fails, while still starting only after that read ends.
+        background_tasks.create_task(safe_save_user_message())
     db_latency = time.perf_counter() - db_load_start
     logger.info(
         "Firestore context load latency for session %s: %.3fs (schedules=%s)",
@@ -98,7 +103,10 @@ async def process_chat(
         "unavailable" if schedules is None else len(schedules),
     )
 
-    # 3. Build token-limited context (returns chronological list)
+    # Persist asynchronously after the history snapshot is complete. This keeps
+    # the current request out of raw_messages without text-based deduplication,
+    # so legitimate repeated questions remain intact.
+    # 2. Build token-limited context (returns chronological list)
     history = build_history(raw_messages, config.HISTORY_TOKEN_BUDGET)
 
     # Convert to OpenAI input format
@@ -106,13 +114,18 @@ async def process_chat(
     # Append the current user message at the end
     history_dicts.append({"role": "user", "content": message})
 
-    # 4. Build system prompt with a compact structured view of all schedules.
+    # 3. Build system prompt with a compact structured view of all schedules.
     schedule_context = build_schedule_context(schedules)
     system_prompt = get_system_prompt(system_context, schedule_context)
 
-    # 5. Route: Decide if we need File Search
-    schedule_query = is_user_schedule_query(message)
-    use_file_search = should_use_file_search(message) and not schedule_query
+    # 4. Current-information requests go straight to the web; static official
+    # and uncertain university intent retain the File Search -> web fallback.
+    intent = classify_query(message)
+    use_web_search = intent is QueryIntent.TIME_SENSITIVE_UNIVERSITY
+    use_file_search = intent in {
+        QueryIntent.OFFICIAL_UNIVERSITY,
+        QueryIntent.UNCERTAIN,
+    }
     tools = []
     if use_file_search:
         tools.append({
@@ -120,7 +133,7 @@ async def process_chat(
             "vector_store_ids": [config.OPENAI_VECTOR_STORE_ID],
         })
 
-    # 6. Stream to client, collect result for Firestore
+    # 5. Stream to client, collect result for Firestore
     accumulated_text: list[str] = []
     accumulated_citations: list[dict] = []
     token_usage = None
@@ -138,7 +151,26 @@ async def process_chat(
             return None
 
     try:
-        if use_file_search:
+        if use_web_search:
+            yield "data: " + json.dumps(
+                {"type": "status", "status": "searching_ku_web"}
+            ) + "\n\n"
+            async for sse_line in stream_response(
+                history_dicts,
+                get_web_search_prompt(system_context, schedule_context),
+                tools=[ku_web_search_tool()],
+            ):
+                if ttft is None and '"type": "chunk"' in sse_line:
+                    ttft = time.perf_counter() - openai_start
+                payload = parse_sse(sse_line)
+                if payload is not None:
+                    if payload.get("type") == "chunk":
+                        accumulated_text.append(payload.get("content", ""))
+                    elif payload.get("type") == "done":
+                        accumulated_citations.extend(payload.get("citations", []))
+                        token_usage = payload.get("usage")
+                yield sse_line
+        elif use_file_search:
             yield "data: " + json.dumps(
                 {"type": "status", "status": "searching_knowledge"}
             ) + "\n\n"
@@ -214,7 +246,7 @@ async def process_chat(
                         accumulated_citations.extend(payload.get("citations", []))
                         token_usage = payload.get("usage")
                 yield sse_line
-            
+
     except asyncio.CancelledError:
         logger.warning("Client disconnected during stream for session %s", session_id)
         raise
@@ -223,7 +255,7 @@ async def process_chat(
         yield f'data: {{"type": "error", "message": "{e}"}}\n\n'
     finally:
         openai_latency = time.perf_counter() - openai_start
-        
+
         # Estimate cost (rough approx for gpt-4o-mini)
         est_cost = 0.0
         if token_usage:
@@ -231,7 +263,7 @@ async def process_chat(
             in_cost = (token_usage.get("prompt_tokens", 0) / 1_000_000) * 0.150
             out_cost = (token_usage.get("completion_tokens", 0) / 1_000_000) * 0.600
             est_cost = in_cost + out_cost
-            
+
         logger.info(
             "OpenAI stream completed.",
             extra={
@@ -244,7 +276,7 @@ async def process_chat(
                 }
             }
         )
-        
+
         # 7. Background Task: Async Database Write
         final_text = "".join(accumulated_text).strip()
         if final_text:
@@ -256,7 +288,7 @@ async def process_chat(
                     citations=accumulated_citations,
                 )
             )
-        
+
         # 8. Background Task: Missed Query Analytics
         was_file_search_attempted = use_file_search
         if (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text:
