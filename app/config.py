@@ -4,12 +4,15 @@ app/config.py
 Reads and validates all required environment variables at startup.
 Set these on Railway via the Railway dashboard → Variables tab.
 """
-from dotenv import load_dotenv
-
 import os
 from functools import lru_cache
+from dotenv import load_dotenv
 
-load_dotenv()
+from .local_notification_test import enabled, validate_environment
+
+# A local test process must never load the repository's normal .env file.
+if not enabled():
+    load_dotenv()
 class Config:
     # ── OpenAI ────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str
@@ -29,8 +32,13 @@ class Config:
     HISTORY_TOKEN_BUDGET: int
 
     def __init__(self) -> None:
-        self.OPENAI_API_KEY = _require("OPENAI_API_KEY")
-        self.OPENAI_VECTOR_STORE_ID = _require("OPENAI_VECTOR_STORE_ID")
+        if enabled():
+            validate_environment()
+            self.OPENAI_API_KEY = "local-mock-no-key"
+            self.OPENAI_VECTOR_STORE_ID = "vs-local-mock"
+        else:
+            self.OPENAI_API_KEY = _require("OPENAI_API_KEY")
+            self.OPENAI_VECTOR_STORE_ID = _require("OPENAI_VECTOR_STORE_ID")
         self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.OPENAI_SCHEDULE_MODEL = os.getenv(
             "OPENAI_SCHEDULE_MODEL", self.OPENAI_MODEL

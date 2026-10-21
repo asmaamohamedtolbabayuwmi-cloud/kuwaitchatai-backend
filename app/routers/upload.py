@@ -18,6 +18,11 @@ from tempfile import NamedTemporaryFile
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 
 from ..auth import verify_admin
+from ..services.knowledge_file_notifications import (
+    create_knowledge_notification_job,
+    process_knowledge_notification_job,
+)
+from ..task_tracker import background_tasks
 from ..vector_store import upload_file_to_vector_store
 
 logger = logging.getLogger(__name__)
@@ -77,6 +82,24 @@ async def upload(
             )
 
         vs_file = await upload_file_to_vector_store(temp_file_path, file.filename, mime_type)
+        # Attachment is not indexing completion. Persist the follow-up before
+        # returning, then poll outside the request so slow indexing cannot cause
+        # an avoidable HTTP timeout. Startup recovery resumes unfinished jobs.
+        notification_status = "queued"
+        try:
+            await create_knowledge_notification_job(vs_file.file_id, vs_file.filename)
+            background_tasks.create_task(
+                process_knowledge_notification_job(vs_file.file_id)
+            )
+        except Exception as notification_exc:
+            # The OpenAI upload remains valid even if notification bookkeeping
+            # is temporarily unavailable. Operators can reconcile it from logs.
+            notification_status = "scheduling_failed"
+            logger.exception(
+                "Knowledge notification scheduling failed for %s: %s",
+                vs_file.file_id,
+                notification_exc,
+            )
 
     except HTTPException:
         raise
@@ -94,4 +117,6 @@ async def upload(
         "file_id": vs_file.file_id,
         "filename": vs_file.filename,
         "status": "success",
+        "indexing_status": vs_file.status,
+        "notification_status": notification_status,
     }

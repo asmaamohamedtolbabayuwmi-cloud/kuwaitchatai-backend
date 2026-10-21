@@ -19,3 +19,9 @@ venv.bak/
 .idea/
 *.swp
 *.swo
+
+# Isolated notification-test runtime output (may contain notification text).
+.local-test/
+firestore-debug.log
+firebase-debug.log
+ui-debug.log

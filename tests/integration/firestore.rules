@@ -1,0 +1,31 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isTestAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.testOnly == true
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // The debug app may create/read only its own explicitly test-only identity.
+    // These rules are referenced only by firebase.integration.json.
+    match /users/{userId} {
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.testOnly == true
+        && request.resource.data.role == 'admin';
+      allow read, update: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Permit the emulator-only Admin Dashboard to render its unchanged screens.
+    match /{document=**} {
+      allow read, write: if isTestAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

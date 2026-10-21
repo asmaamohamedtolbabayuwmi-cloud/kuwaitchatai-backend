@@ -18,16 +18,33 @@ import logging
 
 import firebase_admin
 from firebase_admin import credentials
+from google.auth.credentials import AnonymousCredentials
+
+from .local_notification_test import enabled, validate_environment
 
 logger = logging.getLogger(__name__)
 
 _initialized = False
 
 
+class _EmulatorCredential(credentials.Base):
+    def get_credential(self):
+        return AnonymousCredentials()
+
+
 def init_firebase() -> None:
     """Initialise the Firebase Admin SDK. Safe to call multiple times."""
     global _initialized
     if _initialized:
+        return
+
+    if enabled():
+        settings = validate_environment()
+        firebase_admin.initialize_app(
+            _EmulatorCredential(), {"projectId": settings.project_id}
+        )
+        logger.info("Firebase Admin SDK initialised for loopback emulators only.")
+        _initialized = True
         return
 
     sa_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")

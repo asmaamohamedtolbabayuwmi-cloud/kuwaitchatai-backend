@@ -5,3 +5,10 @@ __pycache__/
 .git/
 .vscode/
 .DS_Store
+/local_tools/
+/firebase.integration.json
+/scripts/run_notification_integration_tests.ps1
+/tests/integration/
+/local_tools/fcm_single_device_bridge.py
+/scripts/start_local_notification_backend.ps1
+/scripts/*.ps1

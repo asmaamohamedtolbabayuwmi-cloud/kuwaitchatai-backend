@@ -26,9 +26,11 @@ import logging
 import os
 
 from dotenv import load_dotenv
+from app.local_notification_test import enabled as local_notification_test_enabled
 
 # Load .env for local development (no-op in production where env vars are set directly)
-load_dotenv()
+if not local_notification_test_enabled():
+    load_dotenv()
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +41,13 @@ import uuid
 
 from app.firebase import init_firebase
 from app.limiter import limiter
-from app.routers import assets_router, chat_router, schedules_router, upload_router
+from app.routers import (
+    assets_router,
+    chat_router,
+    notifications_router,
+    schedules_router,
+    upload_router,
+)
 from app.logger import setup_logging, request_id_var
 from app.task_tracker import background_tasks
 
@@ -70,6 +78,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Startup validation failed: {e}")
         raise
+
+    # Notification recovery is deliberately outside fail-fast dependency
+    # validation. Firestore/OpenAI recovery outages must not take chat/RAG down.
+    try:
+        from app.services.knowledge_file_notifications import (
+            recover_pending_knowledge_notification_jobs,
+        )
+
+        background_tasks.create_task(recover_pending_knowledge_notification_jobs())
+    except Exception:
+        logger.exception(
+            "Could not schedule knowledge-job recovery; core API startup continues"
+        )
         
     yield  # App runs here
     
@@ -137,6 +158,7 @@ app.include_router(upload_router)
 app.include_router(assets_router)
 app.include_router(chat_router)
 app.include_router(schedules_router)
+app.include_router(notifications_router)
 
 @app.get("/health", tags=["health"])
 async def health():

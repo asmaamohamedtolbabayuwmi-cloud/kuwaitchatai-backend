@@ -14,6 +14,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from firebase_admin import auth, firestore_async
+from .local_notification_test import enabled, validate_environment
 
 _bearer = HTTPBearer()
 
@@ -42,6 +43,12 @@ async def verify_admin(uid: str = Depends(verify_token)) -> str:
     Verify that the authenticated user has the 'admin' role in Firestore.
     """
     try:
+        if enabled():
+            # The token was verified against the loopback Auth emulator above.
+            # This bypass exists only behind the strict local-test preflight and
+            # cannot be activated in a production environment.
+            validate_environment()
+            return uid
         db = firestore_async.client()
         user_doc = await db.collection("users").document(uid).get()
         if not user_doc.exists or user_doc.to_dict().get("role") != "admin":

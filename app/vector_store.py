@@ -15,6 +15,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 
 from .config import get_config
 from .openai_client import get_openai_client
+from .local_notification_test import enabled as local_notification_test_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,17 @@ async def upload_file_to_vector_store(
     Upload a file to OpenAI Files API (purpose="assistants") and
     immediately attach it to the shared Vector Store.
     """
+    if local_notification_test_enabled():
+        from .local_openai_mock import create_file
+
+        mocked = create_file(filename)
+        return VectorStoreFile(
+            file_id=mocked.file_id,
+            filename=mocked.filename,
+            created_at=mocked.created_at,
+            status=mocked.status,
+        )
+
     client = get_openai_client()
     config = get_config()
     vector_store_id = config.OPENAI_VECTOR_STORE_ID
@@ -82,6 +94,12 @@ async def list_vector_store_files(limit: int = 100, after: str | None = None) ->
     List files attached to the shared Vector Store (Paginated).
     Returns a tuple of (files, last_id, has_more).
     """
+    if local_notification_test_enabled():
+        from .local_openai_mock import list_files
+
+        mocked = list_files()[:limit]
+        return [VectorStoreFile(**vars(item)) for item in mocked], None, False
+
     client = get_openai_client()
     config = get_config()
     vector_store_id = config.OPENAI_VECTOR_STORE_ID
@@ -127,6 +145,12 @@ async def delete_file_from_vector_store(file_id: str) -> None:
     """
     Remove a file from the Vector Store, then delete it from OpenAI Files.
     """
+    if local_notification_test_enabled():
+        from .local_openai_mock import delete_file
+
+        delete_file(file_id)
+        return
+
     client = get_openai_client()
     config = get_config()
     vector_store_id = config.OPENAI_VECTOR_STORE_ID
