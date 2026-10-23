@@ -82,6 +82,7 @@ from app.services.notification_service import (  # noqa: E402
     ANNOUNCEMENTS_COLLECTION,
     KNOWLEDGE_JOBS_COLLECTION,
     DeliveryResult,
+    GENERAL_AUDIENCE_CONDITION,
     NotificationRepository,
     NotificationService,
 )
@@ -93,10 +94,22 @@ class FakeFcmSender:
         self.calls: list[dict[str, object]] = []
 
     async def send_topic(self, **kwargs):
-        self.calls.append(kwargs)
+        self.calls.append({"method": "topic", **kwargs})
         if self.error:
             raise self.error
         return DeliveryResult("fake-fcm-message", str(kwargs["topic"]))
+
+    async def send_general_audience(self, **kwargs):
+        self.calls.append(
+            {
+                "method": "general_audience",
+                "condition": GENERAL_AUDIENCE_CONDITION,
+                **kwargs,
+            }
+        )
+        if self.error:
+            raise self.error
+        return DeliveryResult("fake-fcm-message", "all_users")
 
 
 class FakeIndexingClient:
@@ -213,6 +226,9 @@ class NotificationWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ).get()
                 self.assertEqual(refreshed.to_dict()["viewCount"], 1)
                 self.assertEqual(len(self.sender.calls), 1)
+                self.assertEqual(
+                    self.sender.calls[0]["condition"], GENERAL_AUDIENCE_CONDITION
+                )
 
     async def test_unauthorized_admin_request_never_writes_or_sends(self) -> None:
         protected_app = FastAPI()
@@ -261,6 +277,9 @@ class NotificationWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "sent")
         self.assertEqual(indexing.calls, 2)
         self.assertEqual(len(self.sender.calls), 1)
+        self.assertEqual(
+            self.sender.calls[0]["condition"], GENERAL_AUDIENCE_CONDITION
+        )
         self.assertEqual(self.sender.calls[0]["data"]["type"], "knowledge_file")
 
     async def test_uncertain_knowledge_send_is_quarantined_without_retry(self) -> None:

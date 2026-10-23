@@ -8,8 +8,9 @@ FCM payload contract (all values are strings):
 * app_update: ``version``, ``target_version``, ``force`` (true|false).
 
 Legacy app-update clients remain compatible because ``version`` and ``force``
-retain their existing meanings.  Ordinary notifications use ``all_users``;
-app updates continue to use ``version_X_Y_Z`` topics.
+retain their existing meanings. Ordinary notifications use one FCM condition
+covering ``all_users`` and the legacy iOS ``version_1_1_1`` topic; app updates
+continue to use ``version_X_Y_Z`` topics.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ from ..local_notification_test import (
 logger = logging.getLogger(__name__)
 
 GENERAL_TOPIC = "all_users"
+LEGACY_IOS_TOPIC = "version_1_1_1"
+GENERAL_AUDIENCE_CONDITION = (
+    f"'{GENERAL_TOPIC}' in topics || '{LEGACY_IOS_TOPIC}' in topics"
+)
 ANNOUNCEMENTS_COLLECTION = "announcements"
 KNOWLEDGE_JOBS_COLLECTION = "knowledge_file_notification_jobs"
 _VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
@@ -123,6 +128,40 @@ class ConfirmedPreSendNotificationError(RuntimeError):
 
 
 class FcmSender:
+    @staticmethod
+    def _message_config() -> dict[str, Any]:
+        return {
+            "android": messaging.AndroidConfig(priority="high"),
+            "apns": messaging.APNSConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound="default")
+                ),
+            ),
+        }
+
+    async def send_general_audience(
+        self, *, title: str, body: str, data: dict[str, str]
+    ) -> DeliveryResult:
+        """Send one FCM message to new clients and legacy App Store iOS users."""
+        if local_notification_test_enabled():
+            raise ConfirmedPreSendNotificationError(
+                "Condition delivery is forbidden in local notification test mode."
+            )
+        try:
+            message = messaging.Message(
+                condition=GENERAL_AUDIENCE_CONDITION,
+                notification=messaging.Notification(title=title, body=body),
+                data={key: str(value) for key, value in data.items()},
+                **self._message_config(),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfirmedPreSendNotificationError(str(exc)) from exc
+        message_id = await asyncio.to_thread(messaging.send, message)
+        # Keep the existing logical-audience metadata/API response stable. The
+        # physical FCM destination is GENERAL_AUDIENCE_CONDITION above.
+        return DeliveryResult(message_id=message_id, topic=GENERAL_TOPIC)
+
     async def send_topic(
         self, *, topic: str, title: str, body: str, data: dict[str, str]
     ) -> DeliveryResult:
@@ -135,11 +174,7 @@ class FcmSender:
                 topic=topic,
                 notification=messaging.Notification(title=title, body=body),
                 data={key: str(value) for key, value in data.items()},
-                android=messaging.AndroidConfig(priority="high"),
-                apns=messaging.APNSConfig(
-                    headers={"apns-priority": "10"},
-                    payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
-                ),
+                **self._message_config(),
             )
         except (TypeError, ValueError) as exc:
             raise ConfirmedPreSendNotificationError(str(exc)) from exc
@@ -168,6 +203,15 @@ class LocalSingleDeviceSender:
         except (TypeError, ValueError) as exc:
             raise ConfirmedPreSendNotificationError(str(exc)) from exc
         return DeliveryResult(message_id=message_id, topic=destination)
+
+    async def send_general_audience(
+        self, *, title: str, body: str, data: dict[str, str]
+    ) -> DeliveryResult:
+        # Local safety mode always resolves logical audiences to its one
+        # explicitly configured device; it never forwards an FCM condition.
+        return await self.send_topic(
+            topic=GENERAL_TOPIC, title=title, body=body, data=data
+        )
 
 
 def default_sender() -> FcmSender | LocalSingleDeviceSender:
@@ -384,6 +428,22 @@ class NotificationService:
         self.repository = repository or NotificationRepository()
         self.sender = sender or default_sender()
 
+    async def _send_general_audience(
+        self, *, title: str, body: str, data: dict[str, str]
+    ) -> DeliveryResult:
+        """Use condition delivery without breaking legacy injected senders.
+
+        Older test doubles and integrations may implement only ``send_topic``.
+        The fallback preserves that interface while the production sender uses
+        exactly one condition-addressed Firebase message.
+        """
+        send_general = getattr(self.sender, "send_general_audience", None)
+        if send_general is not None:
+            return await send_general(title=title, body=body, data=data)
+        return await self.sender.send_topic(
+            topic=GENERAL_TOPIC, title=title, body=body, data=data
+        )
+
     async def create_announcement(
         self,
         title: str,
@@ -466,8 +526,8 @@ class NotificationService:
             "body": body,
         }
         try:
-            result = await self.sender.send_topic(
-                topic=GENERAL_TOPIC, title=title, body=body, data=payload
+            result = await self._send_general_audience(
+                title=title, body=body, data=payload
             )
         except ConfirmedPreSendNotificationError as exc:
             try:
@@ -581,8 +641,7 @@ class NotificationService:
         filename = safe_filename(filename)
         title = f"ملف معرفي جديد: {filename}"
         body = f"أصبح ملف {filename} متاحًا للبحث. افتحه لكتابة سؤال عنه."
-        return await self.sender.send_topic(
-            topic=GENERAL_TOPIC,
+        return await self._send_general_audience(
             title=title[:120],
             body=body[:1000],
             data={

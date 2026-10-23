@@ -14,6 +14,8 @@ from app.services.notification_service import (
     AnnouncementStorageError,
     ConfirmedPreSendNotificationError,
     DeliveryResult,
+    FcmSender,
+    GENERAL_AUDIENCE_CONDITION,
     NotificationRepository,
     NotificationService,
     viewer_identity,
@@ -91,14 +93,26 @@ class FakeSender:
         self.calls = []
 
     async def send_topic(self, **kwargs):
-        self.calls.append(kwargs)
+        self.calls.append({"method": "topic", **kwargs})
         if self.error:
             raise self.error
         return DeliveryResult(message_id="message-1", topic=kwargs["topic"])
 
+    async def send_general_audience(self, **kwargs):
+        self.calls.append(
+            {
+                "method": "general_audience",
+                "condition": GENERAL_AUDIENCE_CONDITION,
+                **kwargs,
+            }
+        )
+        if self.error:
+            raise self.error
+        return DeliveryResult(message_id="message-1", topic="all_users")
+
 
 class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_announcement_is_stored_and_targets_general_topic(self):
+    async def test_announcement_uses_one_union_condition_send(self):
         repository = FakeAnnouncementRepository()
         sender = FakeSender()
         result = await NotificationService(repository, sender).create_announcement(
@@ -109,9 +123,50 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["topic"], "all_users")
-        self.assertEqual(sender.calls[0]["topic"], "all_users")
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(sender.calls[0]["method"], "general_audience")
+        self.assertEqual(
+            sender.calls[0]["condition"],
+            "'all_users' in topics || 'version_1_1_1' in topics",
+        )
+        self.assertNotIn("topic", sender.calls[0])
         self.assertEqual(sender.calls[0]["data"]["type"], "announcement")
+        self.assertEqual(sender.calls[0]["data"]["title"], "General notice")
+        self.assertEqual(sender.calls[0]["data"]["body"], "New information")
         self.assertEqual(repository.delivery[-1][1]["status"], "sent")
+
+    async def test_knowledge_file_uses_one_union_condition_send(self):
+        sender = FakeSender()
+        result = await NotificationService(
+            FakeAnnouncementRepository(), sender
+        ).send_knowledge_file(file_id="file-1", filename=" guide.pdf ")
+
+        self.assertEqual(result.message_id, "message-1")
+        self.assertEqual(len(sender.calls), 1)
+        call = sender.calls[0]
+        self.assertEqual(call["method"], "general_audience")
+        self.assertEqual(call["condition"], GENERAL_AUDIENCE_CONDITION)
+        self.assertNotIn("topic", call)
+        self.assertEqual(call["data"]["type"], "knowledge_file")
+        self.assertEqual(call["data"]["event_id"], "knowledge:file-1")
+        self.assertEqual(call["data"]["file_id"], "file-1")
+        self.assertEqual(call["data"]["filename"], "guide.pdf")
+
+    async def test_general_audience_keeps_legacy_sender_test_doubles_working(self):
+        class LegacyTopicOnlySender:
+            def __init__(self):
+                self.calls = []
+
+            async def send_topic(self, **kwargs):
+                self.calls.append(kwargs)
+                return DeliveryResult("legacy-double", kwargs["topic"])
+
+        sender = LegacyTopicOnlySender()
+        await NotificationService(
+            FakeAnnouncementRepository(), sender
+        ).send_knowledge_file(file_id="file-1", filename="guide.pdf")
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(sender.calls[0]["topic"], "all_users")
 
     async def test_ambiguous_send_is_quarantined_and_idempotent_retry_does_not_send(self):
         repository = FakeAnnouncementRepository()
@@ -194,6 +249,10 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
             force=True,
         )
         self.assertEqual(result["topic"], "version_1_2_0")
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(sender.calls[0]["method"], "topic")
+        self.assertEqual(sender.calls[0]["topic"], "version_1_2_0")
+        self.assertNotIn("condition", sender.calls[0])
         self.assertEqual(sender.calls[0]["data"]["force"], "true")
         self.assertEqual(sender.calls[0]["data"]["type"], "app_update")
 
@@ -247,6 +306,38 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
             version="1.3.0",
         )
         self.assertFalse(request.force)
+
+
+class FcmSenderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_general_audience_builds_one_condition_message_with_platform_config(self):
+        with (
+            patch(
+                "app.services.notification_service.local_notification_test_enabled",
+                return_value=False,
+            ),
+            patch(
+                "app.services.notification_service.messaging.send",
+                return_value="projects/test/messages/message-1",
+            ) as send,
+        ):
+            result = await FcmSender().send_general_audience(
+                title="Notice",
+                body="Body",
+                data={"type": "announcement", "number": 7},
+            )
+
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertEqual(message.condition, GENERAL_AUDIENCE_CONDITION)
+        self.assertIsNone(message.topic)
+        self.assertEqual(message.notification.title, "Notice")
+        self.assertEqual(message.notification.body, "Body")
+        self.assertEqual(message.data, {"type": "announcement", "number": "7"})
+        self.assertEqual(message.android.priority, "high")
+        self.assertEqual(message.apns.headers, {"apns-priority": "10"})
+        self.assertEqual(message.apns.payload.aps.sound, "default")
+        self.assertEqual(result.message_id, "projects/test/messages/message-1")
+        self.assertEqual(result.topic, "all_users")
 
 
 class AnnouncementRouteErrorTests(unittest.IsolatedAsyncioTestCase):

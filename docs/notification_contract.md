@@ -46,8 +46,24 @@ still recognized by Flutter.
 
 ## Topics
 
-- `all_users`: announcements and completed knowledge-file indexing events.
+- `all_users`: current-client general audience subscription.
+- `version_1_1_1`: legacy iOS App Store general audience subscription.
 - `version_1_2_0`: app-update targeting for installed version `1.2.0`.
+
+As a temporary legacy compatibility bridge, announcements and completed
+knowledge-file indexing events are each dispatched as exactly one Firebase
+message with this condition:
+
+```text
+'all_users' in topics || 'version_1_1_1' in topics
+```
+
+The backend does not issue separate sends to those topics. A device subscribed
+to both sides of the condition therefore remains part of one FCM multicast
+operation rather than receiving one backend dispatch per subscription. The
+stored and HTTP `topic` metadata remains `all_users` for contract compatibility.
+App-update messages are excluded from this bridge and continue to use only the
+single `version_<target_version>` topic.
 
 Flutter subscribes only after obtaining an FCM token. It subscribes to the
 general topic and to the topic derived from `PackageInfo.version`, subscribing
