@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
 from typing import AsyncIterator
 
 from ..prompts import get_system_prompt, get_web_search_prompt
@@ -19,6 +18,13 @@ from .query_router import (
     should_fallback_to_web,
 )
 from .missed_query_service import analyze_and_log_missed_query
+from .academic_calendar import (
+    calendar_prompt_context,
+    format_calendar_answer,
+    is_english_message,
+    lookup_official_calendar,
+    resolve_calendar_query,
+)
 
 from ..chat_repository import (
     load_recent_messages,
@@ -116,7 +122,28 @@ async def process_chat(
 
     # 3. Build system prompt with a compact structured view of all schedules.
     schedule_context = build_schedule_context(schedules)
-    system_prompt = get_system_prompt(system_context, schedule_context)
+    schedule_colleges = {
+        str((schedule.get("student") or {}).get("college") or "").strip()
+        for schedule in (schedules or [])
+        if str((schedule.get("student") or {}).get("college") or "").strip()
+    }
+    schedule_college = next(iter(schedule_colleges)) if len(schedule_colleges) == 1 else None
+    calendar_query = resolve_calendar_query(
+        message,
+        raw_messages,
+        schedule_college=schedule_college,
+    )
+    calendar_resolution = None
+    academic_calendar_context = (
+        calendar_prompt_context(calendar_query, calendar_resolution)
+        if calendar_query
+        else None
+    )
+    system_prompt = get_system_prompt(
+        system_context,
+        schedule_context,
+        academic_calendar_context,
+    )
 
     # 4. Current-information requests go straight to the web; static official
     # and uncertain university intent retain the File Search -> web fallback.
@@ -138,6 +165,7 @@ async def process_chat(
     accumulated_citations: list[dict] = []
     token_usage = None
     ttft: float | None = None
+    file_search_attempted = False
 
     openai_start = time.perf_counter()
 
@@ -151,13 +179,45 @@ async def process_chat(
             return None
 
     try:
-        if use_web_search:
+        if calendar_query is not None:
+            yield "data: " + json.dumps(
+                {"type": "status", "status": "searching_ku_web"}
+            ) + "\n\n"
+            calendar_resolution = await lookup_official_calendar(calendar_query)
+            answer = format_calendar_answer(
+                calendar_query,
+                calendar_resolution,
+                english=is_english_message(message),
+            )
+            citations = [
+                {
+                    "type": "url_citation",
+                    "url": record.source_url,
+                    "title": record.source_title,
+                    "start_index": 0,
+                    "end_index": 0,
+                }
+                for record in calendar_resolution.records[:1]
+            ]
+            accumulated_text.append(answer)
+            accumulated_citations.extend(citations)
+            yield "data: " + json.dumps(
+                {"type": "chunk", "content": answer}
+            ) + "\n\n"
+            yield "data: " + json.dumps(
+                {"type": "done", "citations": citations}
+            ) + "\n\n"
+        elif use_web_search:
             yield "data: " + json.dumps(
                 {"type": "status", "status": "searching_ku_web"}
             ) + "\n\n"
             async for sse_line in stream_response(
                 history_dicts,
-                get_web_search_prompt(system_context, schedule_context),
+                get_web_search_prompt(
+                    system_context,
+                    schedule_context,
+                    academic_calendar_context,
+                ),
                 tools=[ku_web_search_tool()],
             ):
                 if ttft is None and '"type": "chunk"' in sse_line:
@@ -171,6 +231,7 @@ async def process_chat(
                         token_usage = payload.get("usage")
                 yield sse_line
         elif use_file_search:
+            file_search_attempted = True
             yield "data: " + json.dumps(
                 {"type": "status", "status": "searching_knowledge"}
             ) + "\n\n"
@@ -214,7 +275,11 @@ async def process_chat(
 
                 async for sse_line in stream_response(
                     history_dicts,
-                    get_web_search_prompt(system_context, schedule_context),
+                    get_web_search_prompt(
+                        system_context,
+                        schedule_context,
+                        academic_calendar_context,
+                    ),
                     tools=[ku_web_search_tool()],
                 ):
                     if ttft is None and '"type": "chunk"' in sse_line:
@@ -290,7 +355,7 @@ async def process_chat(
             )
 
         # 8. Background Task: Missed Query Analytics
-        was_file_search_attempted = use_file_search
+        was_file_search_attempted = file_search_attempted
         if (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text:
             background_tasks.create_task(
                 analyze_and_log_missed_query(
