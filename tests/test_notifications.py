@@ -151,6 +151,30 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["data"]["event_id"], "knowledge:file-1")
         self.assertEqual(call["data"]["file_id"], "file-1")
         self.assertEqual(call["data"]["filename"], "guide.pdf")
+        self.assertEqual(call["title"], "ملف معرفي جديد: guide")
+        self.assertIn("ملف guide متاحًا", call["body"])
+
+    async def test_knowledge_file_hides_only_final_recognized_extension(self):
+        cases = (
+            ("الحدود الدنيا.md", "الحدود الدنيا"),
+            ("University Guide.docx", "University Guide"),
+            ("University.Guide.final.PDF", "University.Guide.final"),
+            ("University Guide", "University Guide"),
+        )
+
+        for filename, expected_title in cases:
+            with self.subTest(filename=filename):
+                sender = FakeSender()
+                await NotificationService(
+                    FakeAnnouncementRepository(), sender
+                ).send_knowledge_file(file_id="file-1", filename=filename)
+
+                call = sender.calls[0]
+                self.assertEqual(
+                    call["title"], f"ملف معرفي جديد: {expected_title}"
+                )
+                self.assertIn(f"ملف {expected_title} متاحًا", call["body"])
+                self.assertEqual(call["data"]["filename"], filename)
 
     async def test_general_audience_keeps_legacy_sender_test_doubles_working(self):
         class LegacyTopicOnlySender:

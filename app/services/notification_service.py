@@ -45,6 +45,9 @@ _VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 _INSTALLATION_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
 _DISPATCH_STALE_AFTER = timedelta(minutes=5)
+_KNOWLEDGE_FILE_EXTENSIONS = frozenset(
+    {".pdf", ".txt", ".csv", ".md", ".docx", ".json"}
+)
 
 
 class AnnouncementStorageError(RuntimeError):
@@ -110,6 +113,14 @@ def safe_filename(value: str) -> str:
     if not cleaned:
         return "uploaded file"
     return cleaned[:120]
+
+
+def knowledge_file_display_title(filename: str) -> str:
+    """Remove only a final RAG-supported extension for visible copy."""
+    stem, separator, extension = filename.rpartition(".")
+    if separator and stem and f".{extension.lower()}" in _KNOWLEDGE_FILE_EXTENSIONS:
+        return stem
+    return filename
 
 
 @dataclass(frozen=True)
@@ -639,8 +650,9 @@ class NotificationService:
 
     async def send_knowledge_file(self, *, file_id: str, filename: str) -> DeliveryResult:
         filename = safe_filename(filename)
-        title = f"ملف معرفي جديد: {filename}"
-        body = f"أصبح ملف {filename} متاحًا للبحث. افتحه لكتابة سؤال عنه."
+        display_title = knowledge_file_display_title(filename)
+        title = f"ملف معرفي جديد: {display_title}"
+        body = f"أصبح ملف {display_title} متاحًا للبحث. افتحه لكتابة سؤال عنه."
         return await self._send_general_audience(
             title=title[:120],
             body=body[:1000],
