@@ -268,12 +268,16 @@ async def process_chat(
             citations = [
                 {
                     "type": "url_citation",
-                    "url": record.source_url,
-                    "title": record.source_title,
+                    "url": source.url,
+                    "title": (
+                        source.title_en
+                        if is_english_message(message)
+                        else source.title_ar
+                    ),
                     "start_index": 0,
                     "end_index": 0,
                 }
-                for record in calendar_resolution.records[:1]
+                for source in calendar_resolution.citation_sources
             ]
             accumulated_text.append(answer)
             accumulated_citations.extend(citations)

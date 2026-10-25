@@ -8,8 +8,10 @@ code and a URL citation alone is never considered evidence.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import ssl
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -17,7 +19,7 @@ from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -74,6 +76,8 @@ class CollegeScope(str, Enum):
     LAW = "law"
     ALLIED_HEALTH = "allied_health"
     DENTISTRY = "dentistry"
+    MEDICINE = "medicine"
+    PHARMACY = "pharmacy"
     ENGINEERING = "engineering"
     UNSUPPORTED = "unsupported_college"
 
@@ -92,6 +96,7 @@ class CalendarQuery:
     academic_year: str
     semester: Semester
     college_scope: CollegeScope = CollegeScope.GENERAL
+    college_specified: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,38 +122,87 @@ class EvidenceResolution:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class CalendarComparisonResolution:
+    """Same-event/term evidence collected from the official calendar index."""
+
+    general: EvidenceResolution
+    special: tuple[EvidenceResolution, ...]
+    discovered_special_scopes: tuple[CollegeScope, ...]
+    checked_at: datetime
+    index_status: str = "verified"
+    detail: str | None = None
+
+    @property
+    def records(self) -> tuple[VerifiedCalendarRecord, ...]:
+        return tuple(
+            record
+            for resolution in (self.general, *self.special)
+            for record in resolution.records
+        )
+
+    @property
+    def status(self) -> str:
+        if self.general.status == "verified" or any(
+            item.status == "verified" for item in self.special
+        ):
+            return "verified"
+        if any(item.status == "conflict" for item in (self.general, *self.special)):
+            return "conflict"
+        return self.general.status
+
+    @property
+    def citation_sources(self) -> tuple[OfficialCalendarSource, ...]:
+        seen: set[str] = set()
+        sources: list[OfficialCalendarSource] = []
+        for resolution in (self.general, *self.special):
+            if resolution.source and resolution.source.url not in seen:
+                seen.add(resolution.source.url)
+                sources.append(resolution.source)
+        return tuple(sources)
+
+
+OFFICIAL_CALENDAR_INDEX_URL = "https://do.ku.edu.kw/ar/academic-calendar-0"
+
+# Only the index URL is configured. Special-calendar URLs are deliberately
+# discovered from that official page on every cache refresh.
 OFFICIAL_SOURCES: dict[CollegeScope, OfficialCalendarSource] = {
     CollegeScope.GENERAL: OfficialCalendarSource(
         CollegeScope.GENERAL,
-        "https://do.ku.edu.kw/ar/academic-calendar-0",
+        OFFICIAL_CALENDAR_INDEX_URL,
         "التقويم الجامعي الرسمي لجامعة الكويت",
         "Kuwait University official academic calendar",
     ),
-    CollegeScope.LAW: OfficialCalendarSource(
-        CollegeScope.LAW,
-        "https://do.ku.edu.kw/ar/lawcalender",
-        "تقويم كلية الحقوق بجامعة الكويت",
-        "Kuwait University College of Law calendar",
-    ),
-    CollegeScope.ALLIED_HEALTH: OfficialCalendarSource(
-        CollegeScope.ALLIED_HEALTH,
-        "https://do.ku.edu.kw/ar/college-allied-health-sciencescalender",
+}
+
+_SOURCE_TITLES = {
+    CollegeScope.LAW: ("تقويم كلية الحقوق بجامعة الكويت", "Kuwait University College of Law calendar"),
+    CollegeScope.ALLIED_HEALTH: (
         "تقويم كلية العلوم الطبية المساعدة بجامعة الكويت",
         "Kuwait University College of Allied Health Sciences calendar",
     ),
-    CollegeScope.DENTISTRY: OfficialCalendarSource(
-        CollegeScope.DENTISTRY,
-        "https://do.ku.edu.kw/ar/college-dentistery-calender",
+    CollegeScope.DENTISTRY: (
         "تقويم كلية طب الأسنان بجامعة الكويت",
         "Kuwait University Faculty of Dentistry calendar",
     ),
-    CollegeScope.ENGINEERING: OfficialCalendarSource(
-        CollegeScope.ENGINEERING,
-        "https://engineering.ku.edu.kw/academic-calendar",
+    CollegeScope.MEDICINE: (
+        "تقويم كلية الطب بجامعة الكويت",
+        "Kuwait University Faculty of Medicine calendar",
+    ),
+    CollegeScope.PHARMACY: (
+        "تقويم كلية الصيدلة بجامعة الكويت",
+        "Kuwait University Faculty of Pharmacy calendar",
+    ),
+    CollegeScope.ENGINEERING: (
         "تقويم كلية الهندسة والبترول بجامعة الكويت",
         "Kuwait University College of Engineering and Petroleum calendar",
     ),
 }
+
+CALENDAR_CACHE_TTL_SECONDS = 300.0
+MAX_SPECIAL_CALENDARS = 8
+_CONTENT_CACHE: dict[str, tuple[float, str]] = {}
+_INFLIGHT_FETCHES: dict[tuple[int, str], asyncio.Task[str]] = {}
 
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
@@ -221,17 +275,17 @@ _EVENT_PATTERNS: tuple[tuple[CalendarEvent, tuple[str, ...]], ...] = (
 
 _SEMESTER_PATTERNS = {
     Semester.FIRST: (
-        r"الفصل (?:الدراسي )?(?:ال)?اول",
+        r"(?:الفصل|للفصل) (?:الدراسي )?(?:ال)?اول",
         r"الترم (?:ال)?اول",
         r"(?:first|fall) semester",
     ),
     Semester.SECOND: (
-        r"الفصل (?:الدراسي )?الثاني",
+        r"(?:الفصل|للفصل) (?:الدراسي )?الثاني",
         r"الترم الثاني",
         r"(?:second|spring) semester",
     ),
     Semester.SUMMER: (
-        r"الفصل (?:الدراسي )?الصيفي",
+        r"(?:الفصل|للفصل) (?:الدراسي )?الصيفي",
         r"الترم الصيفي",
         r"summer (?:semester|term)",
     ),
@@ -249,6 +303,8 @@ _COLLEGE_PATTERNS = {
         r"allied health sciences",
     ),
     CollegeScope.DENTISTRY: (r"كلية طب الاسنان", r"faculty of dentistry", r"dentistry college"),
+    CollegeScope.MEDICINE: (r"كلية الطب", r"faculty of medicine", r"medicine college"),
+    CollegeScope.PHARMACY: (r"كلية الصيدلة", r"faculty of pharmacy", r"pharmacy college"),
     CollegeScope.ENGINEERING: (
         r"كلية الهندسة(?: والبترول)?",
         r"college of engineering(?: and petroleum)?",
@@ -368,6 +424,7 @@ def resolve_calendar_query(
     semester = _extract_semester(current)
     academic_year = _extract_academic_year(current)
     college = _extract_college(current)
+    college_specified = college is not None
 
     is_follow_up = any(re.search(pattern, current) for pattern in _FOLLOW_UP_MARKERS)
     if event is None and is_follow_up:
@@ -394,15 +451,19 @@ def resolve_calendar_query(
                 semester = _extract_semester(prior)
             if college is None:
                 college = _extract_college(prior)
+                if college is not None:
+                    college_specified = True
 
     if college is None and re.search(r"(?:كليتي|my college)", current):
         college = _college_from_schedule(schedule_college)
+        college_specified = college is not None
 
     return CalendarQuery(
         event=event,
         academic_year=academic_year or current_year,
         semester=semester or current_semester,
         college_scope=college or CollegeScope.GENERAL,
+        college_specified=college_specified,
     )
 
 
@@ -441,6 +502,87 @@ def _visible_text(html: str) -> str:
     parser = _VisibleTextParser()
     parser.feed(html)
     return parser.text()
+
+
+class _CalendarLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "a":
+            self._href = next((value for key, value in attrs if key == "href"), None)
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, " ".join(self._parts)))
+            self._href = None
+            self._parts = []
+
+
+def _official_ku_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").casefold()
+    return host == "ku.edu.kw" or host.endswith(".ku.edu.kw")
+
+
+def _source_scope(link_text: str, url: str) -> CollegeScope | None:
+    combined = _normalize(f"{link_text} {urlparse(url).path.replace('-', ' ')}")
+    path = urlparse(url).path.casefold()
+    path_aliases = {
+        CollegeScope.LAW: ("lawcalendar", "lawcalender"),
+        CollegeScope.ALLIED_HEALTH: ("allied-health", "allied_health"),
+        CollegeScope.DENTISTRY: ("dentistry", "dentistery"),
+        CollegeScope.MEDICINE: ("medicinecalender", "medicinecalendar"),
+        CollegeScope.PHARMACY: ("pharmacycalender", "pharmacycalendar"),
+        CollegeScope.ENGINEERING: ("engineering",),
+    }
+    for scope, aliases in path_aliases.items():
+        if any(alias in path for alias in aliases):
+            return scope
+    for scope, patterns in _COLLEGE_PATTERNS.items():
+        if any(re.search(pattern, combined) for pattern in patterns):
+            return scope
+    # Preserve a published but newly introduced college calendar as an
+    # independently verified source even before its college alias is known.
+    if re.search(r"(?:كلية|college|faculty)", combined):
+        return CollegeScope.UNSUPPORTED
+    return None
+
+
+def discover_special_calendar_sources(index_html: str) -> tuple[OfficialCalendarSource, ...]:
+    """Discover special calendars only from links published by the KU index."""
+    parser = _CalendarLinkParser()
+    parser.feed(index_html)
+    discovered: list[OfficialCalendarSource] = []
+    seen_urls: set[str] = set()
+    for href, link_text in parser.links:
+        url = urljoin(OFFICIAL_CALENDAR_INDEX_URL, href.strip())
+        if url == OFFICIAL_CALENDAR_INDEX_URL or not _official_ku_url(url):
+            continue
+        if "/taxonomy/" in urlparse(url).path.casefold():
+            continue
+        normalized = _normalize(f"{link_text} {urlparse(url).path}")
+        if not re.search(r"(?:calendar|calender|تقويم)", normalized):
+            continue
+        scope = _source_scope(link_text, url)
+        if scope is None or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        titles = _SOURCE_TITLES.get(scope)
+        clean_title = " ".join(link_text.split())
+        title_ar = titles[0] if titles else clean_title or "تقويم كلية خاص بجامعة الكويت"
+        title_en = titles[1] if titles else clean_title or "Kuwait University special college calendar"
+        discovered.append(OfficialCalendarSource(scope, url, title_ar, title_en))
+        if len(discovered) >= MAX_SPECIAL_CALENDARS:
+            break
+    return tuple(discovered)
 
 
 def _year_from_match(match: re.Match[str]) -> str | None:
@@ -674,29 +816,142 @@ async def _fetch_html(url: str) -> str:
     return await _request_official_html(url, scoped_context)
 
 
+def clear_calendar_content_cache() -> None:
+    """Test/operations hook; cached values are official response bodies only."""
+    _CONTENT_CACHE.clear()
+
+
+async def _cached_official_html(
+    url: str,
+    fetcher: Callable[[str], Awaitable[str]],
+    *,
+    ttl_seconds: float,
+    now: Callable[[], float],
+) -> str:
+    current = now()
+    cached = _CONTENT_CACHE.get(url)
+    if cached and current - cached[0] < ttl_seconds:
+        return cached[1]
+
+    loop = asyncio.get_running_loop()
+    key = (id(loop), url)
+    task = _INFLIGHT_FETCHES.get(key)
+    if task is None:
+        async def fetch_and_cache() -> str:
+            html = await fetcher(url)
+            _CONTENT_CACHE[url] = (now(), html)
+            return html
+
+        task = loop.create_task(fetch_and_cache())
+        _INFLIGHT_FETCHES[key] = task
+
+        def discard(completed: asyncio.Task[str]) -> None:
+            if _INFLIGHT_FETCHES.get(key) is completed:
+                _INFLIGHT_FETCHES.pop(key, None)
+
+        task.add_done_callback(discard)
+
+    # One failed upstream request is shared by concurrent callers but is never
+    # inserted into the content cache, preventing both stale approval and a
+    # same-moment retry stampede.
+    return await asyncio.shield(task)
+
+
 async def lookup_official_calendar(
     query: CalendarQuery,
     *,
     fetcher: Callable[[str], Awaitable[str]] | None = None,
     checked_at: datetime | None = None,
-) -> EvidenceResolution:
-    """Freshly fetch and verify the scope-appropriate official KU calendar."""
+    cache_ttl_seconds: float = CALENDAR_CACHE_TTL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> CalendarComparisonResolution:
+    """Compare same-event/term evidence from the official index and its links."""
     checked_at = checked_at or kuwait_now()
-    source = OFFICIAL_SOURCES.get(query.college_scope)
-    if source is None:
-        return EvidenceResolution(
-            "unsupported_scope", (), None, checked_at, "no registered official college calendar"
-        )
+    fetch = fetcher or _fetch_html
+    general_source = OFFICIAL_SOURCES[CollegeScope.GENERAL]
     try:
-        html = await (fetcher or _fetch_html)(source.url)
-    except Exception as exc:
-        return EvidenceResolution(
-            "unavailable", (), source, checked_at, f"official source fetch failed: {type(exc).__name__}"
+        index_html = await _cached_official_html(
+            OFFICIAL_CALENDAR_INDEX_URL,
+            fetch,
+            ttl_seconds=cache_ttl_seconds,
+            now=monotonic,
         )
-    return verify_official_calendar_html(query, html, source, checked_at=checked_at)
+    except Exception as exc:
+        unavailable = EvidenceResolution(
+            "unavailable",
+            (),
+            general_source,
+            checked_at,
+            f"official index fetch failed: {type(exc).__name__}",
+        )
+        return CalendarComparisonResolution(
+            unavailable,
+            (),
+            (),
+            checked_at,
+            index_status="unavailable",
+            detail=unavailable.detail,
+        )
+
+    general_query = CalendarQuery(
+        query.event, query.academic_year, query.semester, CollegeScope.GENERAL
+    )
+    general = verify_official_calendar_html(
+        general_query, index_html, general_source, checked_at=checked_at
+    )
+    discovered = discover_special_calendar_sources(index_html)
+    requested_source = (
+        next((source for source in discovered if source.scope is query.college_scope), None)
+        if query.college_scope is not CollegeScope.UNSUPPORTED
+        else None
+    )
+    if not query.college_specified:
+        selected = discovered
+    elif query.college_scope is CollegeScope.GENERAL:
+        selected = ()
+    elif requested_source is not None:
+        selected = (requested_source,)
+    else:
+        # For a college not identified by the index, show the available
+        # special-calendar landscape rather than assuming the general date.
+        selected = discovered
+
+    async def verify_source(source: OfficialCalendarSource) -> EvidenceResolution:
+        source_query = CalendarQuery(
+            query.event, query.academic_year, query.semester, source.scope, True
+        )
+        try:
+            html = await _cached_official_html(
+                source.url,
+                fetch,
+                ttl_seconds=cache_ttl_seconds,
+                now=monotonic,
+            )
+        except Exception as exc:
+            return EvidenceResolution(
+                "unavailable",
+                (),
+                source,
+                checked_at,
+                f"official source fetch failed: {type(exc).__name__}",
+            )
+        return verify_official_calendar_html(
+            source_query, html, source, checked_at=checked_at
+        )
+
+    special = tuple(await asyncio.gather(*(verify_source(source) for source in selected)))
+    return CalendarComparisonResolution(
+        general,
+        special,
+        tuple(source.scope for source in discovered),
+        checked_at,
+    )
 
 
-def calendar_prompt_context(query: CalendarQuery, resolution: EvidenceResolution | None = None) -> str:
+def calendar_prompt_context(
+    query: CalendarQuery,
+    resolution: EvidenceResolution | CalendarComparisonResolution | None = None,
+) -> str:
     lines = [
         "<academic_calendar_request>",
         f"event={query.event.value}",
@@ -712,9 +967,247 @@ def calendar_prompt_context(query: CalendarQuery, resolution: EvidenceResolution
 
 def format_calendar_answer(
     query: CalendarQuery,
-    resolution: EvidenceResolution,
+    resolution: EvidenceResolution | CalendarComparisonResolution,
     *,
     english: bool = False,
+) -> str:
+    if isinstance(resolution, CalendarComparisonResolution):
+        return _format_comparison_answer(query, resolution, english=english)
+    return _format_single_calendar_answer(query, resolution, english=english)
+
+
+def _scope_name(scope: CollegeScope, *, english: bool) -> str:
+    names = {
+        CollegeScope.GENERAL: ("جامعة الكويت (التقويم العام)", "Kuwait University (general calendar)"),
+        CollegeScope.LAW: ("كلية الحقوق", "College of Law"),
+        CollegeScope.ALLIED_HEALTH: ("كلية العلوم الطبية المساعدة", "College of Allied Health Sciences"),
+        CollegeScope.DENTISTRY: ("كلية طب الأسنان", "Faculty of Dentistry"),
+        CollegeScope.MEDICINE: ("كلية الطب", "Faculty of Medicine"),
+        CollegeScope.PHARMACY: ("كلية الصيدلة", "Faculty of Pharmacy"),
+        CollegeScope.ENGINEERING: ("كلية الهندسة والبترول", "College of Engineering and Petroleum"),
+        CollegeScope.UNSUPPORTED: ("الكلية المحددة", "the specified college"),
+    }
+    return names[scope][1 if english else 0]
+
+
+def _record_date(record: VerifiedCalendarRecord, *, english: bool) -> str:
+    if record.start_date == record.end_date:
+        if english:
+            return record.start_date.strftime("%d %B %Y").lstrip("0")
+        months = [
+            "", "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+            "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+        ]
+        return f"{record.start_date.day} {months[record.start_date.month]} {record.start_date.year}"
+    if english:
+        start = record.start_date.strftime("%d %B %Y").lstrip("0")
+        end = record.end_date.strftime("%d %B %Y").lstrip("0")
+        return f"{start} to {end}"
+    return (
+        f"{record.start_date.day}/{record.start_date.month}/{record.start_date.year}"
+        f" إلى {record.end_date.day}/{record.end_date.month}/{record.end_date.year}"
+    )
+
+
+def _source_link(source: OfficialCalendarSource, *, english: bool) -> str:
+    return f"[{source.title_en if english else source.title_ar}]({source.url})"
+
+
+def _verified_record(resolution: EvidenceResolution) -> VerifiedCalendarRecord | None:
+    return resolution.records[0] if resolution.status == "verified" and resolution.records else None
+
+
+def _format_comparison_answer(
+    query: CalendarQuery,
+    resolution: CalendarComparisonResolution,
+    *,
+    english: bool,
+) -> str:
+    general_record = _verified_record(resolution.general)
+    requested = (
+        next(
+            (
+                item for item in resolution.special
+                if item.source and item.source.scope is query.college_scope
+            ),
+            None,
+        )
+        if query.college_scope is not CollegeScope.UNSUPPORTED
+        else None
+    )
+    requested_published = (
+        query.college_scope is not CollegeScope.UNSUPPORTED
+        and query.college_scope in resolution.discovered_special_scopes
+    )
+    unsupported_request = (
+        query.college_specified
+        and query.college_scope is not CollegeScope.GENERAL
+        and not requested_published
+        and resolution.index_status == "verified"
+    )
+    discovery_incomplete = (
+        query.college_specified
+        and query.college_scope is not CollegeScope.GENERAL
+        and resolution.index_status != "verified"
+    )
+    lines: list[str] = []
+
+    if requested is not None:
+        record = _verified_record(requested)
+        source = requested.source
+        if record and source:
+            lines.append(
+                (f"**{_scope_name(query.college_scope, english=True)}: {_record_date(record, english=True)}** "
+                 f"— {_source_link(source, english=True)}")
+                if english else
+                (f"**{_scope_name(query.college_scope, english=False)}: {_record_date(record, english=False)}** "
+                 f"— {_source_link(source, english=False)}")
+            )
+        elif source:
+            lines.append(
+                (f"**{_scope_name(query.college_scope, english=True)}: date unverified.** "
+                 f"The published calendar could not provide a single matching date for this event, year, and semester: {_source_link(source, english=True)}")
+                if english else
+                (f"**{_scope_name(query.college_scope, english=False)}: التاريخ غير متحقق منه.** "
+                 f"تعذر استخراج تاريخ واحد مطابق للحدث والسنة والفصل من التقويم المنشور: {_source_link(source, english=False)}")
+            )
+    elif unsupported_request:
+        lines.append(
+            (f"**{_scope_name(query.college_scope, english=True)} is not among the separate special calendars currently identified on the official KU index.**")
+            if english else
+            (f"**{_scope_name(query.college_scope, english=False)} ليست ضمن التقويمات الخاصة المنفصلة المحددة حالياً في فهرس جامعة الكويت الرسمي.**")
+        )
+    elif discovery_incomplete:
+        lines.append(
+            (f"**I couldn't determine whether {_scope_name(query.college_scope, english=True)} has a separate calendar because the official KU index is unavailable.**")
+            if english else
+            (f"**تعذر تحديد ما إذا كانت {_scope_name(query.college_scope, english=False)} لها تقويم منفصل لأن فهرس جامعة الكويت الرسمي غير متاح.**")
+        )
+
+    if general_record and resolution.general.source:
+        prefix = "General university calendar" if english else "التقويم الجامعي العام"
+        lines.append(
+            f"- {prefix}: **{_record_date(general_record, english=english)}** — "
+            f"{_source_link(resolution.general.source, english=english)}"
+        )
+    elif resolution.general.source:
+        lines.append(
+            (f"- General university calendar: **date unverified** for this exact event/year/semester — {_source_link(resolution.general.source, english=True)}")
+            if english else
+            (f"- التقويم الجامعي العام: **التاريخ غير متحقق منه** لهذا الحدث/السنة/الفصل تحديداً — {_source_link(resolution.general.source, english=False)}")
+        )
+
+    # Group only truly comparable records: same event, academic year and term
+    # have already been enforced by the evidence verifier.
+    groups: dict[tuple[date, date], list[EvidenceResolution]] = {}
+    same_as_general: list[EvidenceResolution] = []
+    for item in resolution.special:
+        record = _verified_record(item)
+        if record is None or item is requested:
+            continue
+        if general_record and (record.start_date, record.end_date) == (
+            general_record.start_date, general_record.end_date
+        ):
+            same_as_general.append(item)
+        else:
+            groups.setdefault((record.start_date, record.end_date), []).append(item)
+
+    for items in groups.values():
+        record = _verified_record(items[0])
+        assert record is not None
+        names = ", ".join(
+            _scope_name(item.source.scope, english=english)
+            if item.source and item.source.scope is not CollegeScope.UNSUPPORTED
+            else (item.source.title_en if english else item.source.title_ar)
+            for item in items
+            if item.source
+        )
+        links = ", ".join(
+            _source_link(item.source, english=english) for item in items if item.source
+        )
+        lines.append(f"- {names}: **{_record_date(record, english=english)}** — {links}")
+
+    if same_as_general:
+        names = ", ".join(
+            _scope_name(item.source.scope, english=english)
+            for item in same_as_general if item.source
+        )
+        links = ", ".join(
+            _source_link(item.source, english=english)
+            for item in same_as_general if item.source
+        )
+        lines.append(
+            (f"- Verified with the same date as the general calendar: {names} — {links}.")
+            if english else
+            (f"- تم التحقق من أنها تحمل التاريخ العام نفسه: {names} — {links}.")
+        )
+
+    unverified = [
+        item for item in resolution.special
+        if item.status != "verified" and item is not requested and item.source
+    ]
+    if unverified:
+        entries = ", ".join(
+            f"{_scope_name(item.source.scope, english=english)} ({_source_link(item.source, english=english)})"
+            if item.source.scope is not CollegeScope.UNSUPPORTED else _source_link(item.source, english=english)
+            for item in unverified
+        )
+        lines.append(
+            (f"Coverage limitation: the matching date is **unverified** for {entries}; no date is inferred.")
+            if english else
+            (f"حدود التغطية: التاريخ المطابق **غير متحقق منه** لـ {entries}؛ ولم يتم استنتاج أي تاريخ.")
+        )
+
+    if query.college_specified and query.college_scope is not CollegeScope.GENERAL:
+        if unsupported_request:
+            lines.append(
+                "Do not assume the general date applies; confirm the applicable deadline with the college's Student Affairs Office."
+                if english else
+                "لا تفترض أن الموعد العام ينطبق على الكلية؛ أكّد الموعد المطبق مع مكتب شؤون الطلبة في الكلية."
+            )
+        elif discovery_incomplete:
+            lines.append(
+                "No deadline can be assigned safely; confirm it with the college's Student Affairs Office."
+                if english else
+                "لا يمكن إسناد موعد بأمان؛ أكّده مع مكتب شؤون الطلبة في الكلية."
+            )
+        elif requested is not None and general_record:
+            requested_record = _verified_record(requested)
+            if requested_record is None:
+                lines.append(
+                    "Do not use the general date as a substitute; confirm the college deadline with its Student Affairs Office."
+                    if english else
+                    "لا تستخدم الموعد العام بديلاً؛ أكّد موعد الكلية مع مكتب شؤون الطلبة فيها."
+                )
+            elif (requested_record.start_date, requested_record.end_date) != (
+                general_record.start_date, general_record.end_date
+            ):
+                lines.append(
+                    "The general date is different and must not replace the college-specific deadline."
+                    if english else
+                    "الموعد العام مختلف ولا يجوز استخدامه بدلاً من موعد الكلية الخاص."
+                )
+    else:
+        lines.append(
+            "The general date may not apply to colleges with special calendars."
+            if english else
+            "قد لا ينطبق الموعد العام على الكليات ذات التقويمات الخاصة."
+        )
+
+    if resolution.index_status != "verified":
+        lines.append(
+            "The official calendar index was unavailable, so special-calendar coverage could not be verified."
+            if english else
+            "تعذر الوصول إلى فهرس التقويم الرسمي، لذلك لم يمكن التحقق من تغطية التقويمات الخاصة."
+        )
+    return "\n\n".join(lines)
+
+
+def _format_single_calendar_answer(
+    query: CalendarQuery,
+    resolution: EvidenceResolution,
+    *,
+    english: bool,
 ) -> str:
     if resolution.status != "verified":
         scope_ar = "جامعة الكويت" if query.college_scope is CollegeScope.GENERAL else "الكلية المحددة"
@@ -754,15 +1247,8 @@ def format_calendar_answer(
         Semester.SECOND: "second semester",
         Semester.SUMMER: "summer semester",
     }[query.semester]
-    college_ar = {
-        CollegeScope.GENERAL: "جامعة الكويت",
-        CollegeScope.LAW: "كلية الحقوق",
-        CollegeScope.ALLIED_HEALTH: "كلية العلوم الطبية المساعدة",
-        CollegeScope.DENTISTRY: "كلية طب الأسنان",
-        CollegeScope.ENGINEERING: "كلية الهندسة والبترول",
-        CollegeScope.UNSUPPORTED: "الكلية المحددة",
-    }[query.college_scope]
-    college_en = query.college_scope.value.replace("_", " ")
+    college_ar = _scope_name(query.college_scope, english=False)
+    college_en = _scope_name(query.college_scope, english=True)
 
     if record.start_date == record.end_date:
         months_ar = ["", "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
