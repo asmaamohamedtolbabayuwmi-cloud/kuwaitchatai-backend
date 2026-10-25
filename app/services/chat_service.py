@@ -36,10 +36,13 @@ from ..history_builder import build_history
 from ..responses_api import stream_response
 from ..schedule_repository import load_user_schedules
 from .schedule_context import build_schedule_context
+from .grounding import missing_evidence_answer, sanitize_university_id_answer
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, uid_var
 
 logger = logging.getLogger(__name__)
+
+PERSISTENCE_TIMEOUT_SECONDS = 3.0
 
 
 async def process_chat(
@@ -67,21 +70,34 @@ async def process_chat(
     # ~50 tokens per message on average → budget / 50 + small headroom
     max_docs = max(10, config.HISTORY_TOKEN_BUDGET // 50 + 5)
 
-    # Define the resilient write now, but start it only after history is read.
+    # Define the bounded write now, but start it only after history is read.
     # Otherwise the write can win the race and the current turn is both loaded
     # from Firestore and manually appended below.
-    async def safe_save_user_message():
+    async def safe_save_user_message() -> bool:
         db_start = time.perf_counter()
-        for attempt in range(3):
-            try:
-                await save_user_message(uid, session_id, message, correlation_id=correlation_id)
-                logger.info("Saved user message for session %s in %.3fs", session_id, time.perf_counter() - db_start)
-                break
-            except Exception as e:
-                if attempt == 2:
-                    logger.error("Failed to save user message after 3 attempts for session %s: %s", session_id, e)
-                else:
-                    await asyncio.sleep(1)
+        try:
+            await asyncio.wait_for(
+                save_user_message(
+                    uid,
+                    session_id,
+                    message,
+                    correlation_id=correlation_id,
+                ),
+                timeout=PERSISTENCE_TIMEOUT_SECONDS,
+            )
+            logger.info("Saved user message for session %s in %.3fs", session_id, time.perf_counter() - db_start)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                "Timed out saving user message for session %s after %.1fs",
+                session_id,
+                PERSISTENCE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            # Do not retry an ambiguous commit: a retry with a random document
+            # ID could duplicate the user turn if Firestore committed remotely.
+            logger.error("Failed to save user message for session %s: %s", session_id, exc)
+        return False
 
     # 1. Load history and every stored schedule version concurrently.
     db_load_start = time.perf_counter()
@@ -97,10 +113,12 @@ async def process_chat(
             load_recent_messages(uid, session_id, max_docs),
             safe_load_schedules(),
         )
-    finally:
-        # Preserve the previous best-effort persistence behavior even if a
-        # context read fails, while still starting only after that read ends.
-        background_tasks.create_task(safe_save_user_message())
+    except Exception:
+        # Preserve best-effort persistence when a context read fails.
+        await safe_save_user_message()
+        raise
+
+    user_message_saved = False
     db_latency = time.perf_counter() - db_load_start
     logger.info(
         "Firestore context load latency for session %s: %.3fs (schedules=%s)",
@@ -166,6 +184,8 @@ async def process_chat(
     token_usage = None
     ttft: float | None = None
     file_search_attempted = False
+    done_payload: dict | None = None
+    assistant_persistence_attempted = False
 
     openai_start = time.perf_counter()
 
@@ -178,11 +198,67 @@ async def process_chat(
             logger.warning("Failed to decode SSE line: %s", exc)
             return None
 
+    def public_done(payload: dict) -> str:
+        public_payload = {key: value for key, value in payload.items() if key != "evidence"}
+        return "data: " + json.dumps(public_payload) + "\n\n"
+
+    async def persist_assistant_message() -> None:
+        nonlocal assistant_persistence_attempted
+        if assistant_persistence_attempted:
+            return
+        final_text = "".join(accumulated_text).strip()
+        if not final_text:
+            return
+        assistant_persistence_attempted = True
+        if not user_message_saved:
+            logger.error(
+                "Skipping assistant persistence because the user turn was not saved for session %s",
+                session_id,
+            )
+            return
+        try:
+            await asyncio.wait_for(
+                save_assistant_message(
+                    uid=uid,
+                    session_id=session_id,
+                    content=final_text,
+                    citations=accumulated_citations,
+                ),
+                timeout=PERSISTENCE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Timed out saving assistant message for session %s after %.1fs",
+                session_id,
+                PERSISTENCE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to save assistant message for session %s: %s",
+                session_id,
+                exc,
+            )
+
+    # Start persistence after the history snapshot.  Yield the route status
+    # first so a slow Firestore commit never delays the initial SSE response.
+    user_save_task = asyncio.create_task(safe_save_user_message())
+    background_tasks.tasks.add(user_save_task)
+    user_save_task.add_done_callback(background_tasks.tasks.discard)
+
     try:
+        initial_status = (
+            "searching_ku_web"
+            if calendar_query is not None or use_web_search
+            else "searching_knowledge"
+            if use_file_search
+            else "generating_answer"
+        )
+        yield "data: " + json.dumps(
+            {"type": "status", "status": initial_status}
+        ) + "\n\n"
+        user_message_saved = await asyncio.shield(user_save_task)
+
         if calendar_query is not None:
-            yield "data: " + json.dumps(
-                {"type": "status", "status": "searching_ku_web"}
-            ) + "\n\n"
             calendar_resolution = await lookup_official_calendar(calendar_query)
             answer = format_calendar_answer(
                 calendar_query,
@@ -204,13 +280,12 @@ async def process_chat(
             yield "data: " + json.dumps(
                 {"type": "chunk", "content": answer}
             ) + "\n\n"
-            yield "data: " + json.dumps(
-                {"type": "done", "citations": citations}
-            ) + "\n\n"
+            done_payload = {"type": "done", "citations": citations}
         elif use_web_search:
-            yield "data: " + json.dumps(
-                {"type": "status", "status": "searching_ku_web"}
-            ) + "\n\n"
+            web_text: list[str] = []
+            web_citations: list[dict] = []
+            web_evidence: list[str] = []
+            web_error: dict | None = None
             async for sse_line in stream_response(
                 history_dicts,
                 get_web_search_prompt(
@@ -225,20 +300,37 @@ async def process_chat(
                 payload = parse_sse(sse_line)
                 if payload is not None:
                     if payload.get("type") == "chunk":
-                        accumulated_text.append(payload.get("content", ""))
+                        web_text.append(payload.get("content", ""))
                     elif payload.get("type") == "done":
-                        accumulated_citations.extend(payload.get("citations", []))
+                        web_citations.extend(payload.get("citations", []))
+                        web_evidence.extend(payload.get("evidence", []))
                         token_usage = payload.get("usage")
-                yield sse_line
+                        done_payload = payload
+                    elif payload.get("type") == "error":
+                        web_error = payload
+            if web_error is not None:
+                yield "data: " + json.dumps(web_error) + "\n\n"
+                return
+            answer = "".join(web_text).strip()
+            if not web_citations:
+                answer = missing_evidence_answer(message)
+            else:
+                answer, _ = sanitize_university_id_answer(
+                    message, answer, web_evidence
+                )
+            accumulated_text.append(answer)
+            accumulated_citations.extend(web_citations)
+            yield "data: " + json.dumps(
+                {"type": "chunk", "content": answer}
+            ) + "\n\n"
         elif use_file_search:
             file_search_attempted = True
-            yield "data: " + json.dumps(
-                {"type": "status", "status": "searching_knowledge"}
-            ) + "\n\n"
             buffered_lines: list[str] = []
             retrieved_text: list[str] = []
             retrieved_citations: list[dict] = []
+            retrieved_evidence: list[str] = []
             retrieved_usage = None
+            retrieved_done: dict | None = None
 
             async for sse_line in stream_response(
                 history_dicts, system_prompt, tools=tools
@@ -251,7 +343,9 @@ async def process_chat(
                     retrieved_text.append(payload.get("content", ""))
                 elif payload.get("type") == "done":
                     retrieved_citations.extend(payload.get("citations", []))
+                    retrieved_evidence.extend(payload.get("evidence", []))
                     retrieved_usage = payload.get("usage")
+                    retrieved_done = payload
 
             retrieved_answer = "".join(retrieved_text).strip()
             if not should_fallback_to_web(
@@ -261,18 +355,40 @@ async def process_chat(
                 yield "data: " + json.dumps(
                     {"type": "status", "status": "generating_answer"}
                 ) + "\n\n"
-                accumulated_text.extend(retrieved_text)
+                safe_answer, was_sanitized = sanitize_university_id_answer(
+                    message,
+                    retrieved_answer,
+                    retrieved_evidence,
+                )
                 accumulated_citations.extend(retrieved_citations)
                 token_usage = retrieved_usage
-                for sse_line in buffered_lines:
-                    if ttft is None and '"type": "chunk"' in sse_line:
-                        ttft = time.perf_counter() - openai_start
-                    yield sse_line
+                done_payload = retrieved_done or {
+                    "type": "done",
+                    "citations": retrieved_citations,
+                }
+                if was_sanitized:
+                    accumulated_text.append(safe_answer)
+                    yield "data: " + json.dumps(
+                        {"type": "chunk", "content": safe_answer}
+                    ) + "\n\n"
+                else:
+                    accumulated_text.extend(retrieved_text)
+                    for sse_line in buffered_lines:
+                        payload = parse_sse(sse_line)
+                        if payload is not None and payload.get("type") == "done":
+                            continue
+                        if ttft is None and '"type": "chunk"' in sse_line:
+                            ttft = time.perf_counter() - openai_start
+                        yield sse_line
             else:
                 yield "data: " + json.dumps(
                     {"type": "status", "status": "searching_ku_web"}
                 ) + "\n\n"
 
+                web_text: list[str] = []
+                web_evidence: list[str] = []
+                web_citations: list[dict] = []
+                web_error: dict | None = None
                 async for sse_line in stream_response(
                     history_dicts,
                     get_web_search_prompt(
@@ -287,17 +403,32 @@ async def process_chat(
                     payload = parse_sse(sse_line)
                     if payload is not None:
                         if payload.get("type") == "chunk":
-                            accumulated_text.append(payload.get("content", ""))
+                            web_text.append(payload.get("content", ""))
                         elif payload.get("type") == "done":
-                            accumulated_citations.extend(
-                                payload.get("citations", [])
-                            )
+                            web_citations.extend(payload.get("citations", []))
+                            web_evidence.extend(payload.get("evidence", []))
                             token_usage = payload.get("usage")
-                    yield sse_line
+                            done_payload = payload
+                        elif payload.get("type") == "error":
+                            web_error = payload
+                if web_error is not None:
+                    yield "data: " + json.dumps(web_error) + "\n\n"
+                    return
+                web_answer = "".join(web_text).strip()
+                if not web_citations:
+                    safe_answer = missing_evidence_answer(message)
+                else:
+                    safe_answer, _ = sanitize_university_id_answer(
+                        message,
+                        web_answer,
+                        web_evidence,
+                    )
+                accumulated_text.append(safe_answer)
+                accumulated_citations.extend(web_citations)
+                yield "data: " + json.dumps(
+                    {"type": "chunk", "content": safe_answer}
+                ) + "\n\n"
         else:
-            yield "data: " + json.dumps(
-                {"type": "status", "status": "generating_answer"}
-            ) + "\n\n"
             async for sse_line in stream_response(
                 history_dicts, system_prompt, tools=[]
             ):
@@ -310,7 +441,17 @@ async def process_chat(
                     elif payload.get("type") == "done":
                         accumulated_citations.extend(payload.get("citations", []))
                         token_usage = payload.get("usage")
-                yield sse_line
+                if payload is not None and payload.get("type") == "done":
+                    done_payload = payload
+                else:
+                    yield sse_line
+
+        # `done` means both messages have been committed in order (or that a
+        # persistence failure was logged).  This makes immediate follow-ups see
+        # the complete preceding turn and keeps `done` the final SSE event.
+        await persist_assistant_message()
+        if done_payload is not None:
+            yield public_done(done_payload)
 
     except asyncio.CancelledError:
         logger.warning("Client disconnected during stream for session %s", session_id)
@@ -342,17 +483,11 @@ async def process_chat(
             }
         )
 
-        # 7. Background Task: Async Database Write
+        # Persist partial text on disconnect/error.  Successful streams already
+        # persisted before their final `done` event.
         final_text = "".join(accumulated_text).strip()
-        if final_text:
-            background_tasks.create_task(
-                save_assistant_message(
-                    uid=uid,
-                    session_id=session_id,
-                    content=final_text,
-                    citations=accumulated_citations,
-                )
-            )
+        if final_text and not assistant_persistence_attempted:
+            await persist_assistant_message()
 
         # 8. Background Task: Missed Query Analytics
         was_file_search_attempted = file_search_attempted

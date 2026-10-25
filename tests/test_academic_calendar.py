@@ -134,6 +134,59 @@ def test_college_follow_up_retains_event_year_and_semester():
     assert "22 أكتوبر 2026" in _payload(events[1])["content"]
 
 
+def test_observed_law_college_clarification_retains_calendar_request():
+    history = [
+        {"isUser": False, "content": "الموعد العام هو 24 أكتوبر 2026"},
+        {"isUser": True, "content": "متى آخر يوم للانسحاب من المقررات للفصل الأول؟"},
+    ]
+
+    events = _run_chat("انا كلية حقوق", history)
+
+    assert [_payload(event)["type"] for event in events] == ["status", "chunk", "done"]
+    assert "22 أكتوبر 2026" in _payload(events[1])["content"]
+    assert "24 أكتوبر" not in _payload(events[1])["content"]
+
+
+def test_exact_calendar_sequence_uses_persisted_first_turn_for_law_follow_up():
+    messages = []
+
+    async def load_messages(*_args):
+        return list(reversed(messages))
+
+    async def save_user(uid, session_id, content, **_kwargs):
+        del uid, session_id
+        messages.append({"isUser": True, "content": content})
+
+    async def save_assistant(uid, session_id, content, citations):
+        del uid, session_id
+        messages.append({"isUser": False, "content": content, "citations": citations})
+
+    async def official_lookup(query):
+        html = LAW_HTML if query.college_scope is CollegeScope.LAW else GENERAL_HTML
+        return _verified(query, html)
+
+    async def run(message):
+        return [event async for event in process_chat("uid", "session", message)]
+
+    with (
+        patch("app.services.chat_service.get_config", return_value=CONFIG),
+        patch("app.services.chat_service.load_recent_messages", load_messages),
+        patch("app.services.chat_service.load_user_schedules", _load_schedules),
+        patch("app.services.chat_service.save_user_message", save_user),
+        patch("app.services.chat_service.save_assistant_message", save_assistant),
+        patch("app.services.chat_service.lookup_official_calendar", official_lookup),
+        patch("app.services.academic_calendar.kuwait_today", return_value=TODAY),
+    ):
+        first = asyncio.run(run("متى آخر يوم للانسحاب من المقررات للفصل الأول؟"))
+        second = asyncio.run(run("انا كلية حقوق"))
+
+    assert "24 أكتوبر 2026" in _payload(first[-2])["content"]
+    assert "22 أكتوبر 2026" in _payload(second[-2])["content"]
+    assert "24 أكتوبر" not in _payload(second[-2])["content"]
+    assert [_payload(event)["type"] for event in second] == ["status", "chunk", "done"]
+    assert [message["isUser"] for message in messages] == [True, False, True, False]
+
+
 def test_this_year_and_current_semester_follow_ups_retain_original_event():
     history = [
         {"isUser": False, "content": "إجابة غير صحيحة"},

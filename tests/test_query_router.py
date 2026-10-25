@@ -50,6 +50,23 @@ def test_personal_schedule_queries_bypass_university_document_search():
     assert is_user_schedule_query("ما شروط التسجيل في جامعة الكويت؟") is False
 
 
+def test_university_id_policy_is_an_official_retrieval_query():
+    assert should_use_file_search("صلاحية الهوية الجامعية وتجديدها") is True
+    assert classify_query("صلاحية الهوية الجامعية وتجديدها") is QueryIntent.OFFICIAL_UNIVERSITY
+
+
+def test_conversational_follow_up_variations_do_not_trigger_paid_retrieval():
+    follow_ups = (
+        "مش فاهم الشرح",
+        "مو فاهمة هذي",
+        "وضح لي أكثر",
+        "I don't understand please",
+        "explain that again",
+    )
+    assert all(classify_query(text) is QueryIntent.CASUAL_UNIVERSITY for text in follow_ups)
+    assert all(should_use_file_search(text) is False for text in follow_ups)
+
+
 def test_intent_categories_cover_routing_boundaries():
     assert classify_query("ما شروط القبول في جامعة الكويت؟") is QueryIntent.OFFICIAL_UNIVERSITY
     assert classify_query("متى موعد السحب والإضافة؟") is QueryIntent.TIME_SENSITIVE_UNIVERSITY

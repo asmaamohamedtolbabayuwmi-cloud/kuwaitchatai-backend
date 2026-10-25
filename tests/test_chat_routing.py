@@ -219,7 +219,7 @@ def test_history_snapshot_precedes_save_and_keeps_legitimate_repeat():
         asyncio.run(run())
 
     assert order[0] == "load"
-    assert order.index("load") < order.index("task-created")
+    assert order[:2] == ["load", "save"]
     repeated = [
         item for item in captured["messages"]
         if item == {"role": "user", "content": "اشرح التفاضل"}

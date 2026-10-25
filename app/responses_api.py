@@ -67,6 +67,7 @@ async def stream_response(
 
     full_text_parts: list[str] = []
     raw_citations: list[dict] = []   # file and URL citations
+    evidence_texts: list[str] = []
     usage: dict | None = None
 
     try:
@@ -82,11 +83,21 @@ async def stream_response(
                 }
             ]
 
+        request_options = {
+            "model": config.OPENAI_MODEL,
+            "input": input_messages,
+            "tools": tools,
+        }
+        if tools:
+            request_options["tool_choice"] = "required"
+        if any(tool.get("type") == "file_search" for tool in tools):
+            # `include=None` is not equivalent to omission for every SDK/API
+            # version, so send this parameter only for File Search requests.
+            request_options["include"] = ["file_search_call.results"]
+
         # Responses API streaming — async for loop over events
         async with client.responses.stream(
-            model=config.OPENAI_MODEL,
-            input=input_messages,
-            tools=tools,
+            **request_options,
         ) as stream:
             async for event in stream:
                 event_type = event.type
@@ -113,6 +124,11 @@ async def stream_response(
                             "total_tokens": getattr(response_usage, "total_tokens", 0),
                         }
                     for output in getattr(response, "output", None) or []:
+                        if getattr(output, "type", None) == "file_search_call":
+                            for result in getattr(output, "results", None) or []:
+                                text = str(getattr(result, "text", "") or "").strip()
+                                if text:
+                                    evidence_texts.append(text)
                         if getattr(output, "type", None) == "message":
                             for part in getattr(output, "content", None) or []:
                                 if getattr(part, "type", None) == "output_text":
@@ -193,6 +209,10 @@ async def stream_response(
             ) + "\n\n"
 
     done = {"type": "done", "citations": citation_list}
+    # Internal metadata consumed by chat_service for claim validation.  The
+    # service removes it before forwarding the final SSE event to clients.
+    if evidence_texts:
+        done["evidence"] = evidence_texts
     if usage is not None:
         done["usage"] = usage
     yield "data: " + json.dumps(done) + "\n\n"

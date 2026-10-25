@@ -97,7 +97,15 @@ _CASUAL_EXACT = {
     "وعليكم السلام", "شلونك", "كيفك", "شخبارك", "شكرا", "شكراً",
     "يعطيك العافية", "مشكور", "تمام", "حسنا", "حسنًا", "اوكي",
     "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
+    "مش فاهم", "مو فاهم", "ما فهمت", "وضح اكثر", "وضح أكثر",
+    "i don't understand", "i do not understand", "can you explain that",
 }
+
+_CONVERSATIONAL_FOLLOW_UP_PATTERNS = (
+    r"^(?:مش|مو|ماني|ما) فاهم(?:ة)?(?: (?:الكلام|الشرح|الاجابة|الاجابه|هذا|هذي|ده|دي))?$",
+    r"^(?:وضح|وضّح|اشرح)(?:ها| لي| لي اكثر| لي أكثر| اكثر| أكثر)?$",
+    r"^(?:i (?:do not|don't) understand|can you explain that|explain that again)(?: please)?$",
+)
 
 _TIME_SENSITIVE_MARKERS = (
     r"(?:آخر|اخر|أحدث|احدث|الأحدث|الاحدث|حالي|حالية|الحالي|الحالية|حاليًا|حاليا|الآن|الان|جديد|جديدة|حديث|حديثة|مؤخرًا|مؤخرا|اليوم|الحين|هالفترة|هالأسبوع|هذا الأسبوع|هذا الاسبوع)",
@@ -139,6 +147,9 @@ _OFFICIAL_PATTERNS = (
     r"(?:شهادة|إفادة|افادة|إثبات|اثبات).{0,15}(?:قيد|طالب|استمرارية)",
     r"لمن يهمه الأمر",
     r"(?:enrollment|student status|proof of enrollment|proof of study).{0,20}(?:certificate|letter|document)?",
+    # University ID issuance, validity, replacement, and renewal procedures.
+    r"(?:الهوية|البطاقة) الجامعية",
+    r"(?:university|student) id(?: card)?",
     # Faculty members and administrative staff in an institutional context.
     r"(?:عميد|وكيل|رئيس قسم|مدير|أعضاء هيئة التدريس|عضو هيئة التدريس).{0,35}(?:كلية|قسم|جامعة الكويت|الجامعة|عمادة|إدارة|ادارة)",
     r"(?:منو|من هو|من هي|شنو اسم|وش اسم).{0,20}(?:العميد|الوكيل|رئيس القسم|المدير)",
@@ -194,7 +205,7 @@ def classify_query(user_message: str) -> QueryIntent:
     text = _normalize(user_message)
     if is_user_schedule_query(text):
         return QueryIntent.PERSONAL_SCHEDULE
-    if text in _CASUAL_EXACT:
+    if text in _CASUAL_EXACT or _matches_any(_CONVERSATIONAL_FOLLOW_UP_PATTERNS, text):
         return QueryIntent.CASUAL_UNIVERSITY
     if is_time_sensitive_query(text):
         return QueryIntent.TIME_SENSITIVE_UNIVERSITY

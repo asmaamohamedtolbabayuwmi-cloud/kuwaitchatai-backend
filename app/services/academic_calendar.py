@@ -238,7 +238,12 @@ _SEMESTER_PATTERNS = {
 }
 
 _COLLEGE_PATTERNS = {
-    CollegeScope.LAW: (r"كلية الحقوق", r"(?:college|faculty) of law", r"\blaw college\b", r"بالحقوق"),
+    CollegeScope.LAW: (
+        r"كلية (?:ال)?حقوق",
+        r"(?:college|faculty) of law",
+        r"\blaw college\b",
+        r"بالحقوق",
+    ),
     CollegeScope.ALLIED_HEALTH: (
         r"كلية العلوم الطبية المساعدة",
         r"allied health sciences",
